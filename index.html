@@ -2,87 +2,75 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>Note Share - Home</title>
+<title>Note Share</title>
 <style>
 
     body { font-family: sans-serif; padding: 20px; }
 
-    input, button { padding: 10px; font-size: 1rem; }
+    a { display: block; margin: 8px 0; color: blue; }
+
+    button { padding: 10px 20px; font-size: 1rem; }
 </style>
 </head>
 <body>
 <h1>📝 Note Share</h1>
-<button onclick="createNote()">+ New Note</button>
-<div id="notes"></div>
+<button onclick="newNote()">+ Create New Note</button>
+<h2>Your Notes</h2>
+<div id="list"></div>
 <script>
 
-    async function createNote() {
+    function getNotes() {
+
+      return JSON.parse(localStorage.getItem("notes") || "[]");
+
+    }
+
+    function saveNotes(notes) {
+
+      localStorage.setItem("notes", JSON.stringify(notes));
+
+    }
+
+    function newNote() {
 
       const id = Math.random().toString(36).substring(2, 8);
 
-      await saveNote(id, "");
+      const notes = getNotes();
 
-      location.href = `note.html?id=${id}`;
+      notes.push(id);
 
-    }
+      saveNotes(notes);
 
-    async function saveNote(id, content) {
+      localStorage.setItem("note_" + id, "");
 
-      const db = await openDB();
-
-      db.put("notes", { id, content });
+      location.href = "note.html?id=" + id;
 
     }
 
-    async function openDB() {
+    function listNotes() {
 
-      return await idb.openDB("noteDB", 1, {
+      const notes = getNotes();
 
-        upgrade(db) {
+      const container = document.getElementById("list");
 
-          db.createObjectStore("notes", { keyPath: "id" });
+      if (notes.length === 0) container.textContent = "No notes yet.";
 
-        },
+      notes.forEach(id => {
+
+        const link = document.createElement("a");
+
+        link.href = "note.html?id=" + id;
+
+        link.textContent = "🗒️ Note " + id;
+
+        container.appendChild(link);
 
       });
 
     }
 
-    async function listNotes() {
-
-      const db = await openDB();
-
-      const tx = db.transaction("notes", "readonly");
-
-      const store = tx.objectStore("notes");
-
-      const all = await store.getAll();
-
-      const container = document.getElementById("notes");
-
-      all.forEach(n => {
-
-        const a = document.createElement("a");
-
-        a.href = `note.html?id=${n.id}`;
-
-        a.textContent = `🗒️ ${n.id}`;
-
-        a.style.display = "block";
-
-        container.appendChild(a);
-
-      });
-
-    }
-
-    window.onload = () => {
-
-      listNotes();
-
-    };
+    window.onload = listNotes;
 </script>
-<script src="https://unpkg.com/idb/build/iife/index-min.js"></script>
 </body>
 </html>
  
