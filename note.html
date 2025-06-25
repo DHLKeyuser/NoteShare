@@ -1,0 +1,82 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Edit Note</title>
+<style>
+
+    body { font-family: sans-serif; padding: 20px; }
+
+    textarea { width: 100%; height: 300px; font-size: 1rem; padding: 10px; }
+
+    button { margin-top: 10px; padding: 10px 20px; }
+</style>
+</head>
+<body>
+<h1>Edit Note</h1>
+<textarea id="note"></textarea>
+<br>
+<button onclick="copyLink()">🔗 Copy Link</button>
+<span id="status"></span>
+<script>
+
+    const params = new URLSearchParams(window.location.search);
+
+    const id = params.get("id");
+
+    const textarea = document.getElementById("note");
+
+    async function openDB() {
+
+      return await idb.openDB("noteDB", 1, {
+
+        upgrade(db) {
+
+          db.createObjectStore("notes", { keyPath: "id" });
+
+        },
+
+      });
+
+    }
+
+    async function loadNote() {
+
+      const db = await openDB();
+
+      const note = await db.get("notes", id);
+
+      textarea.value = note?.content || "";
+
+    }
+
+    async function saveNote(content) {
+
+      const db = await openDB();
+
+      await db.put("notes", { id, content });
+
+      document.getElementById("status").textContent = "💾 Saved";
+
+    }
+
+    textarea.addEventListener("input", () => {
+
+      saveNote(textarea.value);
+
+    });
+
+    function copyLink() {
+
+      navigator.clipboard.writeText(location.href);
+
+      alert("Link copied to clipboard!");
+
+    }
+
+    window.onload = loadNote;
+</script>
+<script src="https://unpkg.com/idb/build/iife/index-min.js"></script>
+</body>
+</html>
+ 
