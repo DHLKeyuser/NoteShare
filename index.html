@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Note Share</title>
+<style>
+
+    body {
+
+      font-family: sans-serif;
+
+      padding: 20px;
+
+      max-width: 700px;
+
+      margin: auto;
+
+      background: #f4f4f4;
+
+    }
+
+    textarea {
+
+      width: 100%;
+
+      height: 300px;
+
+      padding: 10px;
+
+      font-size: 1rem;
+
+      border-radius: 5px;
+
+      border: 1px solid #ccc;
+
+    }
+
+    button {
+
+      margin-top: 10px;
+
+      padding: 10px 20px;
+
+      font-size: 1rem;
+
+    }
+
+    #link {
+
+      margin-top: 10px;
+
+      display: block;
+
+      word-break: break-all;
+
+      color: blue;
+
+    }
+</style>
+</head>
+<body>
+<h1>Note Share</h1>
+<textarea id="note" placeholder="Write your note here..."></textarea>
+<br>
+<button onclick="shareNote()">Share Note</button>
+<a id="link" href="#" target="_blank"></a>
+<script>
+
+    const textarea = document.getElementById("note");
+
+    const link = document.getElementById("link");
+
+    // Load note from URL
+
+    const params = new URLSearchParams(window.location.search);
+
+    if (params.has("n")) {
+
+      try {
+
+        textarea.value = decodeURIComponent(atob(params.get("n")));
+
+      } catch (e) {
+
+        textarea.value = "Failed to decode note.";
+
+      }
+
+    }
+
+    function shareNote() {
+
+      const note = textarea.value.trim();
+
+      if (!note) return alert("Note is empty!");
+
+      const encoded = btoa(encodeURIComponent(note));
+
+      const url = `${location.origin}${location.pathname}?n=${encoded}`;
+
+      link.href = url;
+
+      link.textContent = url;
+
+    }
+</script>
+</body>
+</html>
+ 
