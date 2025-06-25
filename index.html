@@ -2,108 +2,87 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<title>Note Share</title>
+<title>Note Share - Home</title>
 <style>
 
-    body {
+    body { font-family: sans-serif; padding: 20px; }
 
-      font-family: sans-serif;
-
-      padding: 20px;
-
-      max-width: 700px;
-
-      margin: auto;
-
-      background: #f4f4f4;
-
-    }
-
-    textarea {
-
-      width: 100%;
-
-      height: 300px;
-
-      padding: 10px;
-
-      font-size: 1rem;
-
-      border-radius: 5px;
-
-      border: 1px solid #ccc;
-
-    }
-
-    button {
-
-      margin-top: 10px;
-
-      padding: 10px 20px;
-
-      font-size: 1rem;
-
-    }
-
-    #link {
-
-      margin-top: 10px;
-
-      display: block;
-
-      word-break: break-all;
-
-      color: blue;
-
-    }
+    input, button { padding: 10px; font-size: 1rem; }
 </style>
 </head>
 <body>
-<h1>Note Share</h1>
-<textarea id="note" placeholder="Write your note here..."></textarea>
-<br>
-<button onclick="shareNote()">Share Note</button>
-<a id="link" href="#" target="_blank"></a>
+<h1>📝 Note Share</h1>
+<button onclick="createNote()">+ New Note</button>
+<div id="notes"></div>
 <script>
 
-    const textarea = document.getElementById("note");
+    async function createNote() {
 
-    const link = document.getElementById("link");
+      const id = Math.random().toString(36).substring(2, 8);
 
-    // Load note from URL
+      await saveNote(id, "");
 
-    const params = new URLSearchParams(window.location.search);
-
-    if (params.has("n")) {
-
-      try {
-
-        textarea.value = decodeURIComponent(atob(params.get("n")));
-
-      } catch (e) {
-
-        textarea.value = "Failed to decode note.";
-
-      }
+      location.href = `note.html?id=${id}`;
 
     }
 
-    function shareNote() {
+    async function saveNote(id, content) {
 
-      const note = textarea.value.trim();
+      const db = await openDB();
 
-      if (!note) return alert("Note is empty!");
-
-      const encoded = btoa(encodeURIComponent(note));
-
-      const url = `${location.origin}${location.pathname}?n=${encoded}`;
-
-      link.href = url;
-
-      link.textContent = url;
+      db.put("notes", { id, content });
 
     }
+
+    async function openDB() {
+
+      return await idb.openDB("noteDB", 1, {
+
+        upgrade(db) {
+
+          db.createObjectStore("notes", { keyPath: "id" });
+
+        },
+
+      });
+
+    }
+
+    async function listNotes() {
+
+      const db = await openDB();
+
+      const tx = db.transaction("notes", "readonly");
+
+      const store = tx.objectStore("notes");
+
+      const all = await store.getAll();
+
+      const container = document.getElementById("notes");
+
+      all.forEach(n => {
+
+        const a = document.createElement("a");
+
+        a.href = `note.html?id=${n.id}`;
+
+        a.textContent = `🗒️ ${n.id}`;
+
+        a.style.display = "block";
+
+        container.appendChild(a);
+
+      });
+
+    }
+
+    window.onload = () => {
+
+      listNotes();
+
+    };
 </script>
+<script src="https://unpkg.com/idb/build/iife/index-min.js"></script>
 </body>
 </html>
  
