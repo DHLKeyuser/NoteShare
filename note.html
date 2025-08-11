@@ -19,6 +19,14 @@ LOGLEVEL = logging.INFO
 FORBIDDEN_UNIT_PRICES = {0.0, 0.1, 0.11}
 NUM_RE = r"[-+]?\d+(?:[.,]\d+)?"
 
+# EU country names (tolerant to common variants)
+EU_ALIASES = {
+    "AUSTRIA","BELGIUM","BULGARIA","CROATIA","CYPRUS","CZECHIA","CZECH REPUBLIC","DENMARK",
+    "ESTONIA","FINLAND","FRANCE","GERMANY","GREECE","HUNGARY","IRELAND","ITALY","LATVIA",
+    "LITHUANIA","LUXEMBOURG","MALTA","NETHERLANDS","THE NETHERLANDS","POLAND","PORTUGAL",
+    "ROMANIA","SLOVAKIA","SLOVENIA","SPAIN","SWEDEN"
+}
+
 # ─── LOGGING ─────────────────────────────────────────────────────────────
 logging.basicConfig(level=LOGLEVEL, format="%(asctime)s %(levelname)-8s %(message)s", datefmt="%H:%M:%S")
 
@@ -61,13 +69,48 @@ def between(text: str, start_pat: str, end_pat: str) -> Optional[str]:
     m2 = re.search(end_pat, tail, flags)
     return tail[:m2.start()] if m2 else tail
 
+def clean_caps(s: str) -> str:
+    return re.sub(r"[^A-Z ]+", " ", (s or "").upper()).strip()
+
 # ─── TOP-LEVEL FIELDS ───────────────────────────────────────────────────
 def parse_sold_to(text: str) -> str:
-    blk = between(text, r"\bSold\s+to\b", r"\bDelivery\s+Ship\s+to\b|^Item\s+Part\s+number\b|^Incoterms\b|^Ship\s+from\b")
+    blk = between(
+        text,
+        r"\bSold\s+to\b",
+        r"\bDelivery\s+Ship\s+to\b|^Item\s+Part\s+number\b|^Incoterms\b|^Ship\s+from\b"
+    )
     return (blk or "").strip()
 
 def sold_to_has_asml(sold_to: str) -> bool:
     return "ASML" in (sold_to or "").upper()
+
+def guess_country_from_sold_to(sold_to: str) -> Optional[str]:
+    """Heuristic: search for any known country token; else take last non-empty line."""
+    if not sold_to: return None
+    caps = clean_caps(sold_to)
+    # fast path: explicit EU tokens
+    for token in sorted(EU_ALIASES, key=len, reverse=True):
+        if token in caps:
+            return token
+    # some common non-EU quick hits
+    NON_EU_HINTS = ["UNITED KINGDOM","UK","NORWAY","SWITZERLAND","ICELAND",
+                    "TURKEY","SERBIA","ALBANIA","NORTH MACEDONIA","MOLDOVA",
+                    "UKRAINE","BELARUS","RUSSIA","UNITED STATES","USA","US",
+                    "CANADA","MEXICO","BRAZIL","CHINA","TAIWAN","JAPAN",
+                    "SINGAPORE","MALAYSIA","INDIA","UNITED ARAB EMIRATES","UAE",
+                    "SAUDI ARABIA","ISRAEL","SOUTH AFRICA","AUSTRALIA","NEW ZEALAND"]
+    for t in NON_EU_HINTS:
+        if t in caps: return t
+    # fallback: last non-empty line
+    lines = [ln.strip() for ln in (sold_to.splitlines()) if ln.strip()]
+    if lines:
+        return clean_caps(lines[-1])
+    return None
+
+def is_country_in_eu(country_name: Optional[str]) -> Optional[bool]:
+    if not country_name: return None
+    c = clean_caps(country_name)
+    return c in EU_ALIASES
 
 def parse_incoterm(text: str) -> Optional[str]:
     line = between(text, r"^Incoterms\b[^\n]*\n", r"\n")
@@ -87,22 +130,15 @@ def parse_currency(text: str) -> Optional[str]:
     return m.group(1).upper() if m else None
 
 # ─── ITEMS ──────────────────────────────────────────────────────────────
-GRAND_TOTAL_RE = rf"(?m)^Total\s+Amount\s*(?:\n\s*{NUM_RE}\b|\s+{NUM_RE}\b)"  # must have a number nearby (not the column header)
+GRAND_TOTAL_RE = rf"(?m)^Total\s+Amount\s*(?:\n\s*{NUM_RE}\b|\s+{NUM_RE}\b)"  # must have a number nearby
 PACKAGING_RE   = r"(?m)^Packaging\s+details\b"
 
 def split_item_blocks(text: str) -> List[str]:
-    """
-    Scan the WHOLE text. An item starts at a line like '001 4022.666.46131'.
-    A block ends at the next item start OR at the grand-total line (with number)
-    OR at 'Packaging details'.
-    """
     starts = [m.start() for m in re.finditer(r"(?m)^\s*\d{3}\s+\S+", text)]
     if not starts: return []
     blocks: List[str] = []
     for i, s in enumerate(starts):
-        # Candidate natural end = next item start
         e = starts[i+1] if i+1 < len(starts) else len(text)
-        # Look for earlier grand total or packaging markers after s
         g = re.search(GRAND_TOTAL_RE, text[s:e])
         if g: e = s + g.start()
         p = re.search(PACKAGING_RE, text[s:e])
@@ -115,14 +151,12 @@ def parse_item_block(block: str) -> Dict[str, Any]:
     head = lines[0] if lines else ""
     m = re.match(r"^(\d{3})\s+(.+)$", head)
     seq, part = (m.group(1), m.group(2)) if m else (None, None)
-
     desc = lines[1] if len(lines) > 1 else None
 
     qty, unit = None, None
     for ln in lines[2:6]:
         m = re.search(rf"\b({NUM_RE})\s+([A-Z]{{1,4}})\b", ln)
-        if m:
-            qty = to_float(m.group(1)); unit = m.group(2); break
+        if m: qty = to_float(m.group(1)); unit = m.group(2); break
 
     unit_price = line_total = None
     if qty is not None:
@@ -164,16 +198,20 @@ def parse_packaging(text: str) -> Dict[str, Any]:
     if m4: out["weight_kg"] = to_float(m4.group(1))
     return out
 
-# ─── CHECKS ─────────────────────────────────────────────────────────────
+# ─── CHECKS (with ASML/EU matrix) ───────────────────────────────────────
 def check_invoice(text: str, filename_dn: Optional[str]) -> List[str]:
     issues: List[str] = []
 
     sold = parse_sold_to(text) or ""
-    need_asml_rules = sold_to_has_asml(sold)
+    has_asml = sold_to_has_asml(sold)
+
+    sold_country = guess_country_from_sold_to(sold)
+    in_eu_opt = is_country_in_eu(sold_country)
+    outside_eu = (in_eu_opt is False)  # None = unknown → treat as not outside-specific rules
 
     incoterm = parse_incoterm(text)
     document = parse_document(text)
-    currency = parse_currency(text)
+    currency  = parse_currency(text)
 
     if not sold.strip(): issues.append("Sold to: block missing.")
     if not incoterm:    issues.append("Incoterms: missing or malformed (need first word below).")
@@ -182,34 +220,69 @@ def check_invoice(text: str, filename_dn: Optional[str]) -> List[str]:
         if filename_dn and document != filename_dn:
             issues.append(f"Document: DN {document} ≠ filename {filename_dn}.")
     if not currency:    issues.append("Currency: missing 'Currency: XXX' line.")
+    if in_eu_opt is None:
+        issues.append("Sold to: country not confidently detected (EU/non-EU rules may be skipped).")
 
+    # Decide rule set
+    require_coo = False
+    require_two_ht = False
+    apply_under_1_eur = False
+
+    if outside_eu and has_asml:
+        require_coo = True
+        require_two_ht = True
+        apply_under_1_eur = True
+    elif outside_eu and not has_asml:
+        require_coo = True
+        require_two_ht = False
+        apply_under_1_eur = True
+    elif (in_eu_opt is True) and (not has_asml):
+        # EU + no ASML: no CoO/HT mandates, no <1€ rule
+        pass
+    else:
+        # Any other ambiguous combo: keep defaults (forbidden price rule still applies)
+        pass
+
+    # Items
     items = parse_items(text)
     if not items:
         issues.append("Items: no item blocks found.")
     else:
         for it in items:
             tag = f"Item {it.get('seq') or '?'} ({it.get('part_number') or 'unknown'})"
-            if it["qty"] is None: issues.append(f"{tag}: Qty missing.")
-            if it["unit_price"] is None: issues.append(f"{tag}: Unit Price missing.")
+
+            if it["qty"] is None:
+                issues.append(f"{tag}: Qty missing.")
+            if it["unit_price"] is None:
+                issues.append(f"{tag}: Unit Price missing.")
             else:
                 up = round(it["unit_price"], 2)
                 if up in FORBIDDEN_UNIT_PRICES:
                     issues.append(f"{tag}: Unit Price is {up:.2f} (forbidden: 0, 0.10, 0.11).")
-            if it["line_total"] is None: issues.append(f"{tag}: Line total missing.")
+                if apply_under_1_eur and up < 1.00:
+                    issues.append(f"{tag}: Unit Price {up:.2f} < 1.00 for non-EU Sold-to.")
+            if it["line_total"] is None:
+                issues.append(f"{tag}: Line total missing.")
             if all(v is not None for v in (it["qty"], it["unit_price"], it["line_total"])):
                 calc = round(it["qty"] * it["unit_price"], 2)
                 if abs(calc - round(it["line_total"], 2)) > 0.02:
                     issues.append(f"{tag}: Qty × Unit Price ({calc:.2f}) ≠ Line Total ({it['line_total']:.2f}).")
-            if need_asml_rules:
-                if not it["coo"]: issues.append(f"{tag}: CoO missing (required when Sold to contains ASML).")
-                if len(it["ht_codes"]) < 2:
-                    issues.append(f"{tag}: Fewer than two HT codes (found {len(it['ht_codes'])}).")
 
+            if require_coo and not it["coo"]:
+                issues.append(f"{tag}: CoO missing (required for this Sold-to).")
+            if require_two_ht and len(it["ht_codes"]) < 2:
+                issues.append(f"{tag}: Fewer than two HT codes (found {len(it['ht_codes'])}).")
+
+    # Packaging (always)
     pkg = parse_packaging(text)
-    if not pkg["colli"]:     issues.append("Packaging: Colli number missing.")
-    if not pkg["dims"]:      issues.append("Packaging: Dimensions missing.")
-    if not pkg["weight_kg"]: issues.append("Packaging: Weight missing.")
+    if not pkg["colli"]:
+        issues.append("Packaging: Colli number missing.")
+    if not pkg["dims"]:
+        issues.append("Packaging: Dimensions missing.")
+    if not pkg["weight_kg"]:
+        issues.append("Packaging: Weight missing.")
 
+    # Heuristics for anomalies
     dims = pkg["dims"]; w = pkg["weight_kg"]
     if dims:
         L, W, H = dims
@@ -273,9 +346,11 @@ class Handler(FileSystemEventHandler):
                     "document_dn": parse_document(text),
                     "incoterm": parse_incoterm(text),
                     "currency": parse_currency(text),
-                    "sold_to_contains_ASML": sold_to_has_asml(parse_sold_to(text)),
-                    "packaging": parse_packaging(text),
+                    "sold_to": parse_sold_to(text),
+                    "sold_to_country": guess_country_from_sold_to(parse_sold_to(text)),
+                    "in_eu": is_country_in_eu(guess_country_from_sold_to(parse_sold_to(text))),
                     "items": [ib for ib in parse_items(text)],
+                    "packaging": parse_packaging(text),
                     "issues": issues
                 }
                 try:
