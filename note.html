@@ -1,85 +1,365 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<title>Edit Note</title>
-<style>
+import os
+import re
+import time
+import json
+import ctypes
+import logging
+from typing import List, Dict, Any, Optional, Tuple
 
-    body { font-family: sans-serif; padding: 20px; }
+import fitz  # PyMuPDF
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
 
-    textarea {
+# ─── CONFIG ──────────────────────────────────────────────────────────────
+DOWNLOADS_FOLDER = os.path.join(os.environ["USERPROFILE"], "Downloads")
+FILENAME_REGEX   = re.compile(r"^\d{8}\.pdf$", re.IGNORECASE)
 
-      width: 100%;
+STABLE_POLLS  = 3
+POLL_INTERVAL = 0.10
+TIMEOUT       = 5.0
 
-      height: 300px;
+WRITE_JSON_REPORT = True
+LOGLEVEL = logging.INFO
 
-      font-size: 1rem;
+FORBIDDEN_UNIT_PRICES = {0.0, 0.1, 0.11}
 
-      padding: 10px;
+# ─── LOGGING ─────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=LOGLEVEL,
+    format="%(asctime)s %(levelname)-8s %(message)s",
+    datefmt="%H:%M:%S",
+)
 
-      margin-bottom: 10px;
+# ─── PDF TEXT ────────────────────────────────────────────────────────────
+def extract_text(pdf_path: str) -> str:
+    doc = fitz.open(pdf_path)
+    parts = []
+    total = len(doc)
+    for i, page in enumerate(doc, 1):
+        parts.append(f"\n----- Page {i}/{total} -----\n{page.get_text('text')}")
+    doc.close()
+    return "".join(parts)
 
+# ─── PARSING HELPERS ────────────────────────────────────────────────────
+NUM_RE = r"[-+]?\d+(?:[.,]\d+)?"
+
+def to_float(s: Optional[str]) -> Optional[float]:
+    if not s: return None
+    s = s.replace("\u00A0", " ").replace(" ", "")
+    if "," in s and "." in s:
+        s = s.replace(".", "").replace(",", ".") if s.rfind(",") > s.rfind(".") else s.replace(",", "")
+    else:
+        if s.count(",") == 1 and len(s) > 3 and s[-3] == ",":
+            s = s.replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+def between(text: str, start_pat: str, end_pat: str) -> Optional[str]:
+    m = re.search(start_pat, text, re.IGNORECASE | re.DOTALL)
+    if not m: return None
+    tail = text[m.end():]
+    m2 = re.search(end_pat, tail, re.IGNORECASE | re.DOTALL)
+    return tail[:m2.start()] if m2 else tail
+
+# ─── TOP-LEVEL FIELDS ───────────────────────────────────────────────────
+def parse_sold_to(text: str) -> str:
+    blk = between(text, r"\bSold\s+to\b", r"\bDelivery\s+Ship\s+to\b|(?mi)^Item\s+Part\s+number\b|(?mi)^Incoterms\b|(?mi)^Ship\s+from\b")
+    return (blk or "").strip()
+
+def sold_to_has_asml(sold_to: str) -> bool:
+    return "ASML" in (sold_to or "").upper()
+
+def parse_incoterm(text: str) -> Optional[str]:
+    # first word below "Incoterms"
+    line = between(text, r"(?mi)^Incoterms\b[^\n]*\n", r"\n")
+    if not line:
+        line = between(text, r"(?mi)^Incoterms\b\s*", r"\n")
+    if not line: return None
+    return (line.strip().split() or [None])[0]
+
+def parse_document(text: str) -> Optional[str]:
+    line = between(text, r"(?mi)^Document\b[^\n]*\n", r"\n")
+    if not line:
+        line = between(text, r"(?mi)^Document\b\s*", r"\n")
+    if not line: return None
+    m = re.search(r"\b\d{6,}\b", line)
+    return m.group(0) if m else None
+
+def parse_currency(text: str) -> Optional[str]:
+    m = re.search(r"(?mi)^Currency\s*:\s*([A-Z]{3})\b", text)
+    return m.group(1).upper() if m else None
+
+# ─── ITEMS ──────────────────────────────────────────────────────────────
+def split_item_blocks(text: str) -> List[str]:
+    area = between(text, r"(?mi)^Item\s+Part\s+number\b", r"(?mi)^Total\s+Amount\b|(?mi)^Packaging\s+details\b|(?mi)^---")
+    if not area:
+        return []
+    starts = [m.start() for m in re.finditer(r"(?m)^\d{3}\s+\S+", area)]
+    blocks = []
+    for i, s in enumerate(starts):
+        e = starts[i+1] if i+1 < len(starts) else len(area)
+        cut = re.search(r"(?mi)^Total\s+Amount\b|^Packaging\s+details\b|^---", area[s:e])
+        if cut: e = s + cut.start()
+        blocks.append(area[s:e].strip())
+    return blocks
+
+def parse_item_block(block: str) -> Dict[str, Any]:
+    lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
+    head = lines[0] if lines else ""
+    m = re.match(r"^(\d{3})\s+(.+)$", head)
+    seq, part = (m.group(1), m.group(2)) if m else (None, None)
+
+    desc = lines[1] if len(lines) > 1 else None
+
+    # qty/unit line like "<num> <UNIT>"
+    qty, unit = None, None
+    for ln in lines[2:6]:
+        m = re.search(rf"\b({NUM_RE})\s+([A-Z]{{1,4}})\b", ln)
+        if m:
+            qty = to_float(m.group(1))
+            unit = m.group(2)
+            break
+
+    # unit price & line total as subsequent standalone numbers
+    unit_price = line_total = None
+    if qty is not None:
+        nums = []
+        for ln in lines:
+            if re.fullmatch(rf"{NUM_RE}", ln.replace(" ", "")):
+                nums.append(ln.replace(" ", ""))
+        if len(nums) >= 2:
+            unit_price = to_float(nums[0])
+            line_total = to_float(nums[1])
+
+    # CoO
+    coo = None
+    for ln in lines:
+        m = re.search(r"(?i)\bCoO\s*:\s*([A-Z]{2,3})\b", ln)
+        if m:
+            coo = m.group(1).upper()
+            break
+
+    # HT codes (count everything like "XX HT: <code>")
+    ht_codes = re.findall(r"(?i)\b[A-Z]{2}\s+HT\s*:\s*([0-9A-Za-z]+)", block)
+
+    return {
+        "seq": seq,
+        "part_number": part,
+        "description": desc,
+        "qty": qty,
+        "unit": unit,
+        "unit_price": unit_price,
+        "line_total": line_total,
+        "coo": coo,
+        "ht_codes": ht_codes,
+        "raw": block,
     }
 
-    button {
+def parse_items(text: str) -> List[Dict[str, Any]]:
+    return [parse_item_block(b) for b in split_item_blocks(text)]
 
-      padding: 10px 20px;
+# ─── PACKAGING ───────────────────────────────────────────────────────────
+def parse_packaging(text: str) -> Dict[str, Any]:
+    blk = between(text, r"(?mi)^Packaging\s+details\b", r"(?mi)^---|\Z")
+    out = {"colli": None, "dims": None, "weight_kg": None}
+    if not blk: return out
 
-      font-size: 1rem;
+    # Colli number after "Colli"
+    m = re.search(r"(?mi)^Colli\s*$", blk)
+    tail = blk[m.end():] if m else blk
+    m2 = re.search(r"\b(\d{6,})\b", tail)
+    if m2: out["colli"] = m2.group(1)
 
-      margin-right: 10px;
+    # Dimensions "a x b x c [M]"
+    m3 = re.search(rf"({NUM_RE})\s*[x×]\s*({NUM_RE})\s*[x×]\s*({NUM_RE})\s*[mM]?\b", blk)
+    if m3:
+        out["dims"] = tuple(to_float(m3.group(i)) for i in (1, 2, 3))
 
-    }
-</style>
-</head>
-<body>
-<h1>Edit Note</h1>
-<textarea id="note"></textarea><br>
-<button onclick="copyLink()">🔗 Copy Link</button>
-<button onclick="goHome()">🏠 Home</button>
-<span id="status"></span>
-<script>
+    # Weight "<num> KG"
+    m4 = re.search(rf"({NUM_RE})\s*KG\b", blk, re.IGNORECASE)
+    if m4: out["weight_kg"] = to_float(m4.group(1))
 
-    const params = new URLSearchParams(location.search);
+    return out
 
-    const id = params.get("id");
+# ─── CHECKS (YOUR RULES) ────────────────────────────────────────────────
+def check_invoice(text: str, filename_dn: Optional[str]) -> List[str]:
+    issues: List[str] = []
 
-    const textarea = document.getElementById("note");
+    sold = parse_sold_to(text) or ""
+    need_asml_rules = sold_to_has_asml(sold)
 
-    if (!id) {
+    incoterm = parse_incoterm(text)
+    document = parse_document(text)
+    currency = parse_currency(text)
 
-      document.body.innerHTML = "<p>Missing note ID</p>";
+    if not sold.strip():
+        issues.append("Sold to: block missing.")
+    if not incoterm:
+        issues.append("Incoterms: missing or malformed (need first word below).")
+    if not document:
+        issues.append("Document: DN number missing.")
+    else:
+        if filename_dn and document != filename_dn:
+            issues.append(f"Document: DN {document} ≠ filename {filename_dn}.")
+    if not currency:
+        issues.append("Currency: missing 'Currency: XXX' line.")
 
-    } else {
+    items = parse_items(text)
+    if not items:
+        issues.append("Items: no item blocks found.")
+    else:
+        for it in items:
+            tag = f"Item {it.get('seq') or '?'} ({it.get('part_number') or 'unknown'})"
 
-      const key = "note_" + id;
+            if it["qty"] is None:
+                issues.append(f"{tag}: Qty missing.")
+            if it["unit_price"] is None:
+                issues.append(f"{tag}: Unit Price missing.")
+            else:
+                up = round(it["unit_price"], 2)
+                if up in FORBIDDEN_UNIT_PRICES:
+                    issues.append(f"{tag}: Unit Price is {up:.2f} (forbidden: 0, 0.10, 0.11).")
+            if it["line_total"] is None:
+                issues.append(f"{tag}: Line total missing.")
+            if all(v is not None for v in (it["qty"], it["unit_price"], it["line_total"])):
+                calc = round(it["qty"] * it["unit_price"], 2)
+                if abs(calc - round(it["line_total"], 2)) > 0.02:
+                    issues.append(f"{tag}: Qty × Unit Price ({calc:.2f}) ≠ Line Total ({it['line_total']:.2f}).")
 
-      textarea.value = localStorage.getItem(key) || "";
+            if need_asml_rules:
+                if not it["coo"]:
+                    issues.append(f"{tag}: CoO missing (required when Sold to contains ASML).")
+                if len(it["ht_codes"]) < 2:
+                    issues.append(f"{tag}: Fewer than two HT codes (found {len(it['ht_codes'])}).")
 
-      textarea.addEventListener("input", () => {
+    pkg = parse_packaging(text)
+    if not pkg["colli"]:
+        issues.append("Packaging: Colli number missing.")
+    if not pkg["dims"]:
+        issues.append("Packaging: Dimensions missing.")
+    if not pkg["weight_kg"]:
+        issues.append("Packaging: Weight missing.")
 
-        localStorage.setItem(key, textarea.value);
+    dims = pkg["dims"]
+    w = pkg["weight_kg"]
+    if dims:
+        L, W, H = dims
+        for d in dims:
+            if d is not None and (d > 3.0 or d < 0.03):  # >3 m or <3 cm looks wrong
+                issues.append(f"Packaging: Dimension {d} m looks abnormal.")
+        if w is not None:
+            max_dim = max(L, W, H)
+            second = sorted(dims)[-2]
+            if w >= 15 and max_dim <= 0.8 and second <= 0.6:
+                issues.append("Packaging: ≥15 kg should not be in a small box (expect pallet-like dimensions).")
+            if max_dim >= 1.5 and w <= 2:
+                issues.append("Packaging: Very large dimensions with very low weight — verify.")
 
-        document.getElementById("status").textContent = "💾 Saved";
+    return issues
 
-      });
+# ─── UI ─────────────────────────────────────────────────────────────────
+def popup(title: str, msg: str):
+    try:
+        ctypes.windll.user32.MessageBoxW(0, msg, title, 0x30)
+    except Exception:
+        logging.warning("Popup failed (non-Windows env?): %s", title)
 
-    }
+# ─── FILE STABILITY ─────────────────────────────────────────────────────
+def wait_for_stable(path: str) -> bool:
+    last, stable = -1, 0
+    deadline = time.time() + TIMEOUT
+    while time.time() < deadline:
+        try:
+            sz = os.path.getsize(path)
+        except Exception:
+            sz = -1
+        if sz == last and sz > 0:
+            stable += 1
+            if stable >= STABLE_POLLS:
+                return True
+        else:
+            stable = 0
+            last = sz
+        time.sleep(POLL_INTERVAL)
+    return False
 
-    function copyLink() {
+# ─── WATCHER ────────────────────────────────────────────────────────────
+class Handler(FileSystemEventHandler):
+    def __init__(self):
+        self._seen = set()
 
-      navigator.clipboard.writeText(location.href);
+    def _try_process(self, path: str):
+        fname = os.path.basename(path)
+        if not FILENAME_REGEX.match(fname) or path in self._seen:
+            return
+        logging.info(f"→ Candidate detected: {fname}")
+        if not wait_for_stable(path):
+            logging.error(f"File never stabilized: {fname}")
+            return
 
-      alert("Link copied!");
+        self._seen.add(path)
+        logging.info(f"Processing {fname}…")
+        try:
+            text = extract_text(path)
+            # if almost no text → likely scanned PDF (needs OCR)
+            if len(text.strip()) < 30:
+                popup("Invoice Warning", f"{fname}: very little text (scanned PDF?).")
+                logging.warning("%s looks scanned (no text).", fname)
 
-    }
+            filename_dn = os.path.splitext(fname)[0] if re.fullmatch(r"\d{8}", os.path.splitext(fname)[0]) else None
+            issues = check_invoice(text, filename_dn)
 
-    function goHome() {
+            if WRITE_JSON_REPORT:
+                sidecar = {
+                    "file": fname,
+                    "document_dn": parse_document(text),
+                    "incoterm": parse_incoterm(text),
+                    "currency": parse_currency(text),
+                    "sold_to_contains_ASML": sold_to_has_asml(parse_sold_to(text)),
+                    "packaging": parse_packaging(text),
+                    "items": [ib for ib in parse_items(text)],
+                    "issues": issues
+                }
+                with open(path + ".check.json", "w", encoding="utf-8") as f:
+                    json.dump(sidecar, f, indent=2, ensure_ascii=False)
 
-      window.location.href = "index.html";
+            if issues:
+                msg = f"Issues in {fname}:\n\n" + "\n".join(issues)
+                popup("Invoice Issues", msg)
+                logging.warning("%d issue(s) in %s", len(issues), fname)
+            else:
+                logging.info("No issues in %s", fname)
 
-    }
-</script>
-</body>
-</html>
- 
+        except Exception as e:
+            logging.exception("Error on %s: %s", fname, e)
+            popup("Invoice Error", f"{fname} error:\n{e}")
+
+    def on_created(self, event):
+        if not event.is_directory:
+            self._try_process(event.src_path)
+
+    def on_moved(self, event):
+        if not event.is_directory:
+            self._try_process(event.dest_path)
+
+def main():
+    if not os.path.isdir(DOWNLOADS_FOLDER):
+        logging.error(f"Downloads not found: {DOWNLOADS_FOLDER}")
+        return
+    obs = Observer()
+    obs.schedule(Handler(), DOWNLOADS_FOLDER, recursive=False)
+    obs.start()
+    logging.info("Watching for 8-digit PDFs in:\n  " + DOWNLOADS_FOLDER)
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        obs.stop()
+    obs.join()
+
+if __name__ == "__main__":
+    main()
