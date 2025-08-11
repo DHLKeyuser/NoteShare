@@ -112,7 +112,7 @@ def guess_country_from_sold_to(sold_to: str) -> Optional[str]:
         "SOUTH AFRICA","SAUDI ARABIA","CZECH REPUBLIC","NORTH MACEDONIA","SWITZERLAND","ICELAND",
         "NORWAY","TURKEY","SERBIA","ALBANIA","MOLDOVA","UKRAINE","BELARUS","RUSSIA","CANADA",
         "MEXICO","BRAZIL","CHINA","TAIWAN","JAPAN","SINGAPORE","MALAYSIA","INDIA","ISRAEL",
-        "AUSTRALIA","HONG KONG","KOREA","KOREA REP","KOREA, REP"
+        "AUSTRALIA","HONG KONG","KOREA","KOREA REP","U.S.A."
     ]
     for token in NON_EU_HINTS:
         pat = r"\b" + re.escape(token) + r"\b"
@@ -151,6 +151,11 @@ def parse_currency(text: str) -> Optional[str]:
     return m.group(1).upper() if m else None
 
 # ─── ITEMS ──────────────────────────────────────────────────────────────
+# Accept numbers with optional thousands (.,) and optional decimal (.,)
+PRICE_TOKEN_RE = re.compile(
+   r"^[-+]?\d{1,3}(?:[.,]\d{3})*(?:[.,]\d+)?$"   # e.g. 1,234.56  or 1.234,56
+   r"|^[-+]?\d+(?:[.,]\d+)?$"                    # e.g. 1234.56  or 1234,56
+)
 GRAND_TOTAL_RE = rf"(?m)^Total\s+Amount\s*(?:\n\s*{NUM_RE}\b|\s+{NUM_RE}\b)"  # must have a number nearby
 PACKAGING_RE   = r"(?m)^Packaging\s+details\b"
 
@@ -184,11 +189,12 @@ def parse_item_block(block: str) -> Dict[str, Any]:
     if qty is not None:
         nums = []
         for ln in lines:
-            s = _strip_all_spaces(ln)  # use robust whitespace stripper
-            if re.fullmatch(rf"{NUM_RE}", s):
+            s = _strip_all_spaces(ln)  # strips spaces, NBSP, thin spaces
+            if PRICE_TOKEN_RE.fullmatch(s):
                 nums.append(s)
         if len(nums) >= 2:
-            unit_price = to_float(nums[0]); line_total = to_float(nums[1])
+            unit_price = to_float(nums[0])
+            line_total  = to_float(nums[1])
 
     coo = None
     for ln in lines:
