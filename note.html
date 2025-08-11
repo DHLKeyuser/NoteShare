@@ -1,222 +1,387 @@
-import os
-import re
-import time
-import json
-import ctypes
-import logging
-import fitz
+import os, re, time, json, ctypes, logging
+from typing import List, Dict, Any, Optional, Tuple
+import fitz  # PyMuPDF
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
-# ─── CONFIG ───────────────────────────────────────────────
+# ─── CONFIG ──────────────────────────────────────────────────────────────
 DOWNLOADS_FOLDER = os.path.join(os.environ["USERPROFILE"], "Downloads")
 FILENAME_REGEX   = re.compile(r"^\d{8}\.pdf$", re.IGNORECASE)
 
 STABLE_POLLS  = 3
-POLL_INTERVAL = 0.1
+POLL_INTERVAL = 0.10
 TIMEOUT       = 5.0
 
-EU_COUNTRIES = {
-    "AUSTRIA","BELGIUM","BULGARIA","CROATIA","CYPRUS","CZECHIA","CZECH REPUBLIC",
-    "DENMARK","ESTONIA","FINLAND","FRANCE","GERMANY","GREECE","HUNGARY","IRELAND",
-    "ITALY","LATVIA","LITHUANIA","LUXEMBOURG","MALTA","NETHERLANDS","THE NETHERLANDS",
-    "POLAND","PORTUGAL","ROMANIA","SLOVAKIA","SLOVENIA","SPAIN","SWEDEN"
+WRITE_JSON_REPORT = True     # write <file>.check.json
+DEBUG_DUMP = True            # write <file>.txt with extracted text
+LOGLEVEL = logging.INFO
+
+FORBIDDEN_UNIT_PRICES = {0.0, 0.1, 0.11, 0.01}
+NUM_RE = r"[-+]?\d+(?:[.,]\d+)?"
+
+# EU country names (tolerant to common variants)
+EU_ALIASES = {
+    "AUSTRIA","BELGIUM","BULGARIA","CROATIA","CYPRUS","CZECHIA","CZECH REPUBLIC","DENMARK",
+    "ESTONIA","FINLAND","FRANCE","GERMANY","GREECE","HUNGARY","IRELAND","ITALY","LATVIA",
+    "LITHUANIA","LUXEMBOURG","MALTA","NETHERLANDS","THE NETHERLANDS","POLAND","PORTUGAL",
+    "ROMANIA","SLOVAKIA","SLOVENIA","SPAIN","SWEDEN"
 }
 
-FORBIDDEN_PRICES = {0.0, 0.1, 0.11, 0.01}
+# ─── LOGGING ─────────────────────────────────────────────────────────────
+logging.basicConfig(level=LOGLEVEL, format="%(asctime)s %(levelname)-8s %(message)s", datefmt="%H:%M:%S")
 
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s %(levelname)-8s %(message)s",
-    datefmt="%H:%M:%S"
-)
-
-# ─── HELPERS ───────────────────────────────────────────────
-def extract_text(path: str) -> str:
-    doc = fitz.open(path)
-    txt = "\n".join(p.get_text("text") for p in doc)
+# ─── PDF → TEXT ─────────────────────────────────────────────────────────
+def extract_text(pdf_path: str) -> str:
+    doc = fitz.open(pdf_path)
+    parts = []
+    total = len(doc)
+    for i, page in enumerate(doc, 1):
+        parts.append(f"\n----- Page {i}/{total} -----\n{page.get_text('text')}")
     doc.close()
-    return txt.replace("\xa0", " ")  # replace non-breaking spaces
+    text = "".join(parts)
+    if DEBUG_DUMP:
+        try:
+            with open(pdf_path + ".txt", "w", encoding="utf-8") as f:
+                f.write(text)
+        except Exception as e:
+            logging.warning("Couldn't write debug dump: %s", e)
+    return text
 
-def guess_country_from_sold_to(sold_to: str) -> str:
-    if not sold_to:
-        return ""
-    lines = [ln.strip() for ln in sold_to.splitlines() if ln.strip()]
-    country_line = lines[-1].upper()
-    return country_line.split(",")[0]  # remove ", R.O.C." etc.
-
-def is_country_in_eu(country_name: str) -> bool:
-    return country_name.upper() in EU_COUNTRIES
-
-def parse_invoice(text: str, filename: str) -> dict:
-    res = {"file": filename, "issues": []}
-
-    # Sold to block
-    sold_to_match = re.search(r"Sold to\s+(.*?)\nDelivery Ship to", text, re.S)
-    sold_to_block = sold_to_match.group(1).strip() if sold_to_match else ""
-    res["sold_to"] = sold_to_block
-    res["sold_to_contains_ASML"] = "ASML" in sold_to_block.upper()
-    country = guess_country_from_sold_to(sold_to_block)
-    res["sold_to_country"] = country
-    res["in_eu"] = is_country_in_eu(country)
-
-    # Document DN
-    dn_match = re.search(r"Document\s+(\d{8})", text)
-    if dn_match:
-        res["document_dn"] = dn_match.group(1)
-        if res["document_dn"] != os.path.splitext(filename)[0]:
-            res["issues"].append(f"Document: DN {res['document_dn']} ≠ filename {filename}.")
+# ─── HELPERS ────────────────────────────────────────────────────────────
+def to_float(s: Optional[str]) -> Optional[float]:
+    if not s: return None
+    s = s.replace("\u00A0", " ").replace(" ", "")
+    if "," in s and "." in s:
+        s = s.replace(".", "").replace(",", ".") if s.rfind(",") > s.rfind(".") else s.replace(",", "")
     else:
-        res["issues"].append("Document: Missing DN.")
+        if s.count(",") == 1 and len(s) > 3 and s[-3] == ",":
+            s = s.replace(",", ".")
+        else:
+            s = s.replace(",", "")
+    try: return float(s)
+    except Exception: return None
 
-    # Incoterm
-    incoterm_match = re.search(r"Incoterms\s+([A-Z]+)", text)
-    res["incoterm"] = incoterm_match.group(1) if incoterm_match else ""
+def between(text: str, start_pat: str, end_pat: str) -> Optional[str]:
+    flags = re.IGNORECASE | re.MULTILINE | re.DOTALL
+    m = re.search(start_pat, text, flags)
+    if not m: return None
+    tail = text[m.end():]
+    m2 = re.search(end_pat, tail, flags)
+    return tail[:m2.start()] if m2 else tail
 
-    # Currency
-    currency_match = re.search(r"Currency:\s*([A-Z]+)", text)
-    res["currency"] = currency_match.group(1) if currency_match else ""
+def clean_caps(s: str) -> str:
+    return re.sub(r"[^A-Z ]+", " ", (s or "").upper()).strip()
+
+# ─── TOP-LEVEL FIELDS ───────────────────────────────────────────────────
+def parse_sold_to(text: str) -> str:
+    blk = between(
+        text,
+        r"\bSold\s+to\b",
+        r"\bDelivery\s+Ship\s+to\b|^Item\s+Part\s+number\b|^Incoterms\b|^Ship\s+from\b"
+    )
+    return (blk or "").strip()
+
+def sold_to_has_asml(sold_to: str) -> bool:
+    return "ASML" in (sold_to or "").upper()
+
+def guess_country_from_sold_to(sold_to: str) -> Optional[str]:
+    """Heuristic: search for any known country token; else take last non-empty line."""
+    if not sold_to: return None
+    caps = clean_caps(sold_to)
+    # fast path: explicit EU tokens
+    for token in sorted(EU_ALIASES, key=len, reverse=True):
+        if token in caps:
+            return token
+    # some common non-EU quick hits
+    NON_EU_HINTS = ["UNITED KINGDOM","UK","NORWAY","SWITZERLAND","ICELAND",
+                    "TURKEY","SERBIA","ALBANIA","NORTH MACEDONIA","MOLDOVA",
+                    "UKRAINE","BELARUS","RUSSIA","UNITED STATES","USA","US",
+                    "CANADA","MEXICO","BRAZIL","CHINA","TAIWAN","JAPAN",
+                    "SINGAPORE","MALAYSIA","INDIA","UNITED ARAB EMIRATES","UAE",
+                    "SAUDI ARABIA","ISRAEL","SOUTH AFRICA","AUSTRALIA","NEW ZEALAND"]
+    for t in NON_EU_HINTS:
+        if t in caps: return t
+    # fallback: last non-empty line
+    lines = [ln.strip() for ln in (sold_to.splitlines()) if ln.strip()]
+    if lines:
+        return clean_caps(lines[-1])
+    return None
+
+def is_country_in_eu(country_name: Optional[str]) -> Optional[bool]:
+    if not country_name: return None
+    c = clean_caps(country_name)
+    return c in EU_ALIASES
+
+def parse_incoterm(text: str) -> Optional[str]:
+    line = between(text, r"^Incoterms\b[^\n]*\n", r"\n")
+    if not line: line = between(text, r"^Incoterms\b\s*", r"\n")
+    if not line: return None
+    return (line.strip().split() or [None])[0]
+
+def parse_document(text: str) -> Optional[str]:
+    line = between(text, r"^Document\b[^\n]*\n", r"\n")
+    if not line: line = between(text, r"^Document\b\s*", r"\n")
+    if not line: return None
+    m = re.search(r"\b\d{6,}\b", line)
+    return m.group(0) if m else None
+
+def parse_currency(text: str) -> Optional[str]:
+    m = re.search(r"^Currency\s*:\s*([A-Z]{3})\b", text, re.IGNORECASE | re.MULTILINE)
+    return m.group(1).upper() if m else None
+
+# ─── ITEMS ──────────────────────────────────────────────────────────────
+GRAND_TOTAL_RE = rf"(?m)^Total\s+Amount\s*(?:\n\s*{NUM_RE}\b|\s+{NUM_RE}\b)"  # must have a number nearby
+PACKAGING_RE   = r"(?m)^Packaging\s+details\b"
+
+def split_item_blocks(text: str) -> List[str]:
+    starts = [m.start() for m in re.finditer(r"(?m)^\s*\d{3}\s+\S+", text)]
+    if not starts: return []
+    blocks: List[str] = []
+    for i, s in enumerate(starts):
+        e = starts[i+1] if i+1 < len(starts) else len(text)
+        g = re.search(GRAND_TOTAL_RE, text[s:e])
+        if g: e = s + g.start()
+        p = re.search(PACKAGING_RE, text[s:e])
+        if p: e = s + p.start()
+        blocks.append(text[s:e].strip())
+    return blocks
+
+def parse_item_block(block: str) -> Dict[str, Any]:
+    lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
+    head = lines[0] if lines else ""
+    m = re.match(r"^(\d{3})\s+(.+)$", head)
+    seq, part = (m.group(1), m.group(2)) if m else (None, None)
+    desc = lines[1] if len(lines) > 1 else None
+
+    qty, unit = None, None
+    for ln in lines[2:6]:
+        m = re.search(rf"\b({NUM_RE})\s+([A-Z]{{1,4}})\b", ln)
+        if m: qty = to_float(m.group(1)); unit = m.group(2); break
+
+    unit_price = line_total = None
+    if qty is not None:
+        nums = []
+        for ln in lines:
+            if re.fullmatch(rf"{NUM_RE}", ln.replace(" ", "")):
+                nums.append(ln.replace(" ", ""))
+        if len(nums) >= 2:
+            unit_price = to_float(nums[0]); line_total = to_float(nums[1])
+
+    coo = None
+    for ln in lines:
+        m = re.search(r"\bCoO\s*:\s*([A-Z]{2,3})\b", ln, re.IGNORECASE)
+        if m: coo = m.group(1).upper(); break
+
+    ht_codes = re.findall(r"\b[A-Z]{2}\s+HT\s*:\s*([0-9A-Za-z]+)", block, re.IGNORECASE)
+
+    return {
+        "seq": seq, "part_number": part, "description": desc,
+        "qty": qty, "unit": unit, "unit_price": unit_price, "line_total": line_total,
+        "coo": coo, "ht_codes": ht_codes, "raw": block,
+    }
+
+def parse_items(text: str) -> List[Dict[str, Any]]:
+    return [parse_item_block(b) for b in split_item_blocks(text)]
+
+# ─── PACKAGING ───────────────────────────────────────────────────────────
+def parse_packaging(text: str) -> Dict[str, Any]:
+    blk = between(text, r"^Packaging\s+details\b", r"^---|\Z")
+    out = {"colli": None, "dims": None, "weight_kg": None}
+    if not blk: return out
+    m = re.search(r"(?m)^Colli\s*$", blk)
+    tail = blk[m.end():] if m else blk
+    m2 = re.search(r"\b(\d{6,})\b", tail)
+    if m2: out["colli"] = m2.group(1)
+    m3 = re.search(rf"({NUM_RE})\s*[x×]\s*({NUM_RE})\s*[x×]\s*({NUM_RE})\s*[mM]?\b", blk)
+    if m3: out["dims"] = tuple(to_float(m3.group(i)) for i in (1,2,3))
+    m4 = re.search(rf"({NUM_RE})\s*KG\b", blk, re.IGNORECASE)
+    if m4: out["weight_kg"] = to_float(m4.group(1))
+    return out
+
+# ─── CHECKS (with ASML/EU matrix) ───────────────────────────────────────
+def check_invoice(text: str, filename_dn: Optional[str]) -> List[str]:
+    issues: List[str] = []
+
+    sold = parse_sold_to(text) or ""
+    has_asml = sold_to_has_asml(sold)
+
+    sold_country = guess_country_from_sold_to(sold)
+    in_eu_opt = is_country_in_eu(sold_country)
+    outside_eu = (in_eu_opt is False)  # None = unknown → treat as not outside-specific rules
+
+    incoterm = parse_incoterm(text)
+    document = parse_document(text)
+    currency  = parse_currency(text)
+
+    if not sold.strip(): issues.append("Sold to: block missing.")
+    if not incoterm:    issues.append("Incoterms: missing or malformed (need first word below).")
+    if not document:    issues.append("Document: DN number missing.")
+    else:
+        if filename_dn and document != filename_dn:
+            issues.append(f"Document: DN {document} ≠ filename {filename_dn}.")
+    if not currency:    issues.append("Currency: missing 'Currency: XXX' line.")
+    if in_eu_opt is None:
+        issues.append("Sold to: country not confidently detected (EU/non-EU rules may be skipped).")
+
+    # Decide rule set
+    require_coo = False
+    require_two_ht = False
+    apply_under_1_eur = False
+
+    if outside_eu and has_asml:
+        require_coo = True
+        require_two_ht = True
+        apply_under_1_eur = True
+    elif outside_eu and not has_asml:
+        require_coo = True
+        require_two_ht = False
+        apply_under_1_eur = True
+    elif (in_eu_opt is True) and (not has_asml):
+        # EU + no ASML: no CoO/HT mandates, no <1€ rule
+        pass
+    else:
+        # Any other ambiguous combo: keep defaults (forbidden price rule still applies)
+        pass
 
     # Items
-    items = []
-    item_blocks = re.findall(r"(\d{3}\s+\S+[\s\S]*?)(?=(?:\n\d{3}\s)|\nPackaging details|\Z)", text)
-    for block in item_blocks:
-        seq_match = re.match(r"(\d{3})\s+(\S+)", block)
-        if not seq_match:
-            continue
-        seq, part_number = seq_match.groups()
-        qty_match = re.search(r"\n(\d+(?:\.\d+)?)\s+PC", block)
-        unit_price_match = re.search(r"\n([\d,]+\.\d{2})\n([\d,]+\.\d{2})", block)
-        coo_match = re.search(r"CoO:\s*(\S+)", block)
-        ht_matches = re.findall(r"HT:\s*(\d+)", block)
-
-        qty = float(qty_match.group(1)) if qty_match else None
-        unit_price = float(unit_price_match.group(1).replace(",", "")) if unit_price_match else None
-        line_total = float(unit_price_match.group(2).replace(",", "")) if unit_price_match else None
-
-        item_data = {
-            "seq": seq,
-            "part_number": part_number,
-            "qty": qty,
-            "unit": "PC",
-            "unit_price": unit_price,
-            "line_total": line_total,
-            "coo": coo_match.group(1) if coo_match else None,
-            "ht_codes": ht_matches,
-            "raw": block.strip()
-        }
-        items.append(item_data)
-    res["items"] = items
-
-    # Packaging
-    pkg_match = re.search(r"Packaging details\s+Colli\s+Dimensions\s+Weight\s+(\S+)\s+([\d\.]+)\s*x\s*([\d\.]+)\s*x\s*([\d\.]+)\s*M\s+([\d\.]+)\s+KG", text)
-    if pkg_match:
-        res["packaging"] = {
-            "colli": pkg_match.group(1),
-            "dims": [float(pkg_match.group(2)), float(pkg_match.group(3)), float(pkg_match.group(4))],
-            "weight_kg": float(pkg_match.group(5))
-        }
+    items = parse_items(text)
+    if not items:
+        issues.append("Items: no item blocks found.")
     else:
-        res["packaging"] = {}
-        res["issues"].append("Packaging: Missing colli/dimensions/weight.")
+        for it in items:
+            tag = f"Item {it.get('seq') or '?'} ({it.get('part_number') or 'unknown'})"
 
-    # ─── VALIDATIONS ─────────────────────────────────────
-    for item in items:
-        price_issue = (
-            item["unit_price"] in FORBIDDEN_PRICES or
-            item["unit_price"] is None or
-            (not res["in_eu"] and item["unit_price"] < 1)
-        )
-        if price_issue:
-            res["issues"].append(f"Item {item['seq']} ({item['part_number']}): Invalid unit price {item['unit_price']}.")
+            if it["qty"] is None:
+                issues.append(f"{tag}: Qty missing.")
+            if it["unit_price"] is None:
+                issues.append(f"{tag}: Unit Price missing.")
+            else:
+                up = round(it["unit_price"], 2)
+                if up in FORBIDDEN_UNIT_PRICES:
+                    issues.append(f"{tag}: Unit Price is {up:.2f} (Please check).")
+                if apply_under_1_eur and up < 1.00:
+                    issues.append(f"{tag}: Unit Price {up:.2f}, What is under 1 euro")
+            if it["line_total"] is None:
+                issues.append(f"{tag}: Line total missing.")
+            if all(v is not None for v in (it["qty"], it["unit_price"], it["line_total"])):
+                calc = round(it["qty"] * it["unit_price"], 2)
+                if abs(calc - round(it["line_total"], 2)) > 0.02:
+                    issues.append(f"{tag}: Qty × Unit Price ({calc:.2f}) ≠ Line Total ({it['line_total']:.2f}).")
 
-        if (res["sold_to_contains_ASML"] or not res["in_eu"]) and not item["coo"]:
-            res["issues"].append(f"Item {item['seq']} ({item['part_number']}): Missing CoO.")
+            if require_coo and not it["coo"]:
+                issues.append(f"{tag}: CoO missing (required for this Sold-to).")
+            if require_two_ht and len(it["ht_codes"]) < 2:
+                issues.append(f"{tag}: Fewer than two HT codes (found {len(it['ht_codes'])}).")
 
-        if (res["sold_to_contains_ASML"] or not res["in_eu"]) and len(item["ht_codes"]) < 2:
-            res["issues"].append(f"Item {item['seq']} ({item['part_number']}): Fewer than two HT codes (found {len(item['ht_codes'])}).")
+    # Packaging (always)
+    pkg = parse_packaging(text)
+    if not pkg["colli"]:
+        issues.append("Packaging: Colli number missing.")
+    if not pkg["dims"]:
+        issues.append("Packaging: Dimensions missing.")
+    if not pkg["weight_kg"]:
+        issues.append("Packaging: Weight missing.")
 
-    if "packaging" in res and res["packaging"]:
-        dims = res["packaging"]["dims"]
-        weight = res["packaging"]["weight_kg"]
-        if not res["packaging"]["colli"]:
-            res["issues"].append("Packaging: Missing colli number.")
-        if any(d <= 0 or d > 10 for d in dims):
-            res["issues"].append("Packaging: Abnormal dimension size.")
-        if weight <= 0 or weight > 1000:
-            res["issues"].append("Packaging: Abnormal weight.")
-        if weight > 15 and all(d < 0.8 for d in dims):
-            res["issues"].append("Packaging: Heavy item in box-sized dimensions.")
+    # Heuristics for anomalies
+    dims = pkg["dims"]; w = pkg["weight_kg"]
+    if dims:
+        L, W, H = dims
+        for d in dims:
+            if d is not None and (d > 3.0 or d < 0.03):
+                issues.append(f"Packaging: Dimension {d} m looks abnormal.")
+        if w is not None:
+            max_dim = max(L, W, H); second = sorted(dims)[-2]
+            if w >= 15 and max_dim <= 0.8 and second <= 0.6:
+                issues.append("Packaging: ≥15 kg should not be in a small box (expect pallet-like dimensions).")
+            if max_dim >= 1.5 and w <= 2:
+                issues.append("Packaging: Very large dimensions with very low weight — verify.")
 
-    return res
+    return issues
 
+# ─── UI ─────────────────────────────────────────────────────────────────
 def popup(title: str, msg: str):
-    ctypes.windll.user32.MessageBoxW(0, msg, title, 0x30)
+    try: ctypes.windll.user32.MessageBoxW(0, msg, title, 0x30)
+    except Exception: logging.warning("Popup failed (non-Windows env?): %s", title)
 
+# ─── FILE STABILITY ─────────────────────────────────────────────────────
 def wait_for_stable(path: str) -> bool:
     last, stable = -1, 0
     deadline = time.time() + TIMEOUT
     while time.time() < deadline:
-        try:
-            sz = os.path.getsize(path)
-        except:
-            sz = -1
+        try: sz = os.path.getsize(path)
+        except Exception: sz = -1
         if sz == last and sz > 0:
             stable += 1
-            if stable >= STABLE_POLLS:
-                return True
+            if stable >= STABLE_POLLS: return True
         else:
-            stable = 0
-            last = sz
+            stable = 0; last = sz
         time.sleep(POLL_INTERVAL)
     return False
 
+# ─── WATCHER ────────────────────────────────────────────────────────────
 class Handler(FileSystemEventHandler):
-    def __init__(self):
-        self._seen = set()
+    def __init__(self): self._seen = set()
 
     def _try_process(self, path: str):
         fname = os.path.basename(path)
-        if not FILENAME_REGEX.match(fname) or path in self._seen:
-            return
+        if not FILENAME_REGEX.match(fname) or path in self._seen: return
         logging.info(f"→ Candidate detected: {fname}")
         if not wait_for_stable(path):
-            logging.error(f"File never stabilized: {fname}")
-            return
-        self._seen.add(path)
+            logging.error(f"File never stabilized: {fname}"); return
+
+        self._seen.add(path); logging.info(f"Processing {fname}…")
         try:
-            txt = extract_text(path)
-            result = parse_invoice(txt, fname)
-            if result["issues"]:
-                msg = f"Issues in {fname}:\n\n" + "\n".join(result["issues"])
+            text = extract_text(path)
+            if len(text.strip()) < 30:
+                popup("Invoice Warning", f"{fname}: very little text (scanned PDF?).")
+                logging.warning("%s looks scanned (no text).", fname)
+
+            base = os.path.splitext(fname)[0]
+            filename_dn = base if re.fullmatch(r"\d{8}", base) else None
+            issues = check_invoice(text, filename_dn)
+
+            if WRITE_JSON_REPORT:
+                sidecar = {
+                    "file": fname,
+                    "document_dn": parse_document(text),
+                    "incoterm": parse_incoterm(text),
+                    "currency": parse_currency(text),
+                    "sold_to": parse_sold_to(text),
+                    "sold_to_country": guess_country_from_sold_to(parse_sold_to(text)),
+                    "in_eu": is_country_in_eu(guess_country_from_sold_to(parse_sold_to(text))),
+                    "items": [ib for ib in parse_items(text)],
+                    "packaging": parse_packaging(text),
+                    "issues": issues
+                }
+                try:
+                    with open(path + ".check.json", "w", encoding="utf-8") as f:
+                        json.dump(sidecar, f, indent=2, ensure_ascii=False)
+                except Exception as e:
+                    logging.warning("Couldn't write JSON sidecar: %s", e)
+
+            if issues:
+                msg = f"Issues in {fname}:\n\n" + "\n".join(issues)
                 popup("Invoice Issues", msg)
-                logging.warning(f"{len(result['issues'])} issue(s) in {fname}")
+                logging.warning("%d issue(s) in %s", len(issues), fname)
             else:
-                logging.info(f"No issues in {fname}")
-            logging.debug(json.dumps(result, indent=2))
+                logging.info("No issues in %s", fname)
+
         except Exception as e:
-            logging.exception(f"Error on {fname}: {e}")
+            logging.exception("Error on %s: %s", fname, e)
             popup("Invoice Error", f"{fname} error:\n{e}")
 
     def on_created(self, event):
-        if not event.is_directory:
-            self._try_process(event.src_path)
-
+        if not event.is_directory: self._try_process(event.src_path)
     def on_moved(self, event):
-        if not event.is_directory:
-            self._try_process(event.dest_path)
+        if not event.is_directory: self._try_process(event.dest_path)
 
 def main():
     if not os.path.isdir(DOWNLOADS_FOLDER):
-        logging.error(f"Downloads not found: {DOWNLOADS_FOLDER}")
-        return
-    obs = Observer()
-    obs.schedule(Handler(), DOWNLOADS_FOLDER, recursive=False)
-    obs.start()
-    logging.info("Watching for 8-digit PDFs in:\n  " + DOWNLOADS_FOLDER)
+        logging.error(f"Downloads not found: {DOWNLOADS_FOLDER}"); return
+    obs = Observer(); obs.schedule(Handler(), DOWNLOADS_FOLDER, recursive=False)
+    obs.start(); logging.info("Watching for 8-digit PDFs in:\n  " + DOWNLOADS_FOLDER)
     try:
-        while True:
-            time.sleep(1)
+        while True: time.sleep(1)
     except KeyboardInterrupt:
         obs.stop()
     obs.join()
