@@ -1,11 +1,5 @@
-import os
-import re
-import time
-import json
-import ctypes
-import logging
+import os, re, time, json, ctypes, logging
 from typing import List, Dict, Any, Optional, Tuple
-
 import fitz  # PyMuPDF
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -22,19 +16,14 @@ WRITE_JSON_REPORT = True     # write <file>.check.json
 DEBUG_DUMP = True            # write <file>.txt with extracted text
 LOGLEVEL = logging.INFO
 
-# forbidden unit prices
 FORBIDDEN_UNIT_PRICES = {0.0, 0.1, 0.11}
+NUM_RE = r"[-+]?\d+(?:[.,]\d+)?"
 
 # ─── LOGGING ─────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=LOGLEVEL,
-    format="%(asctime)s %(levelname)-8s %(message)s",
-    datefmt="%H:%M:%S",
-)
+logging.basicConfig(level=LOGLEVEL, format="%(asctime)s %(levelname)-8s %(message)s", datefmt="%H:%M:%S")
 
 # ─── PDF → TEXT ─────────────────────────────────────────────────────────
 def extract_text(pdf_path: str) -> str:
-    """Return all text from PDF with page separators. Also dumps <pdf>.txt if DEBUG_DUMP."""
     doc = fitz.open(pdf_path)
     parts = []
     total = len(doc)
@@ -50,12 +39,9 @@ def extract_text(pdf_path: str) -> str:
             logging.warning("Couldn't write debug dump: %s", e)
     return text
 
-# ─── PARSING HELPERS ────────────────────────────────────────────────────
-NUM_RE = r"[-+]?\d+(?:[.,]\d+)?"
-
+# ─── HELPERS ────────────────────────────────────────────────────────────
 def to_float(s: Optional[str]) -> Optional[float]:
-    if not s:
-        return None
+    if not s: return None
     s = s.replace("\u00A0", " ").replace(" ", "")
     if "," in s and "." in s:
         s = s.replace(".", "").replace(",", ".") if s.rfind(",") > s.rfind(".") else s.replace(",", "")
@@ -64,48 +50,35 @@ def to_float(s: Optional[str]) -> Optional[float]:
             s = s.replace(",", ".")
         else:
             s = s.replace(",", "")
-    try:
-        return float(s)
-    except Exception:
-        return None
+    try: return float(s)
+    except Exception: return None
 
 def between(text: str, start_pat: str, end_pat: str) -> Optional[str]:
-    """Return substring between start_pat and end_pat using I|M|S flags."""
     flags = re.IGNORECASE | re.MULTILINE | re.DOTALL
     m = re.search(start_pat, text, flags)
-    if not m:
-        return None
+    if not m: return None
     tail = text[m.end():]
     m2 = re.search(end_pat, tail, flags)
     return tail[:m2.start()] if m2 else tail
 
 # ─── TOP-LEVEL FIELDS ───────────────────────────────────────────────────
 def parse_sold_to(text: str) -> str:
-    blk = between(
-        text,
-        r"\bSold\s+to\b",
-        r"\bDelivery\s+Ship\s+to\b|^Item\s+Part\s+number\b|^Incoterms\b|^Ship\s+from\b"
-    )
+    blk = between(text, r"\bSold\s+to\b", r"\bDelivery\s+Ship\s+to\b|^Item\s+Part\s+number\b|^Incoterms\b|^Ship\s+from\b")
     return (blk or "").strip()
 
 def sold_to_has_asml(sold_to: str) -> bool:
     return "ASML" in (sold_to or "").upper()
 
 def parse_incoterm(text: str) -> Optional[str]:
-    # first word below "Incoterms"
     line = between(text, r"^Incoterms\b[^\n]*\n", r"\n")
-    if not line:
-        line = between(text, r"^Incoterms\b\s*", r"\n")
-    if not line:
-        return None
+    if not line: line = between(text, r"^Incoterms\b\s*", r"\n")
+    if not line: return None
     return (line.strip().split() or [None])[0]
 
 def parse_document(text: str) -> Optional[str]:
     line = between(text, r"^Document\b[^\n]*\n", r"\n")
-    if not line:
-        line = between(text, r"^Document\b\s*", r"\n")
-    if not line:
-        return None
+    if not line: line = between(text, r"^Document\b\s*", r"\n")
+    if not line: return None
     m = re.search(r"\b\d{6,}\b", line)
     return m.group(0) if m else None
 
@@ -114,31 +87,27 @@ def parse_currency(text: str) -> Optional[str]:
     return m.group(1).upper() if m else None
 
 # ─── ITEMS ──────────────────────────────────────────────────────────────
+GRAND_TOTAL_RE = rf"(?m)^Total\s+Amount\s*(?:\n\s*{NUM_RE}\b|\s+{NUM_RE}\b)"  # must have a number nearby (not the column header)
+PACKAGING_RE   = r"(?m)^Packaging\s+details\b"
+
 def split_item_blocks(text: str) -> List[str]:
     """
-    Robust splitter:
-    1) Try the area between 'Item Part number' and an end marker.
-    2) If not found, scan the WHOLE text for numbered lines '^\d{3}\s+\S+'.
+    Scan the WHOLE text. An item starts at a line like '001 4022.666.46131'.
+    A block ends at the next item start OR at the grand-total line (with number)
+    OR at 'Packaging details'.
     """
-    end_markers = r"^Total\s+Amount\b|^Packaging\s+details\b|^Total\s+Net\s+Weight\b|^Special\s+Packaging\b|^---"
-
-    area = between(text, r"^Item\s+Part\s+number\b", end_markers)
-    if not area:
-        area = between(text, r"^Item\s+.*Part\s+.*number\b", end_markers)
-    if not area:
-        area = text  # fallback
-
-    starts = [m.start() for m in re.finditer(r"(?m)^\d{3}\s+\S+", area)]
-    if not starts:
-        return []
-
+    starts = [m.start() for m in re.finditer(r"(?m)^\s*\d{3}\s+\S+", text)]
+    if not starts: return []
     blocks: List[str] = []
     for i, s in enumerate(starts):
-        e = starts[i+1] if i+1 < len(starts) else len(area)
-        cut = re.search(end_markers, area[s:e], re.MULTILINE | re.IGNORECASE)
-        if cut:
-            e = s + cut.start()
-        blocks.append(area[s:e].strip())
+        # Candidate natural end = next item start
+        e = starts[i+1] if i+1 < len(starts) else len(text)
+        # Look for earlier grand total or packaging markers after s
+        g = re.search(GRAND_TOTAL_RE, text[s:e])
+        if g: e = s + g.start()
+        p = re.search(PACKAGING_RE, text[s:e])
+        if p: e = s + p.start()
+        blocks.append(text[s:e].strip())
     return blocks
 
 def parse_item_block(block: str) -> Dict[str, Any]:
@@ -149,16 +118,12 @@ def parse_item_block(block: str) -> Dict[str, Any]:
 
     desc = lines[1] if len(lines) > 1 else None
 
-    # qty/unit line like "<num> <UNIT>"
     qty, unit = None, None
     for ln in lines[2:6]:
         m = re.search(rf"\b({NUM_RE})\s+([A-Z]{{1,4}})\b", ln)
         if m:
-            qty = to_float(m.group(1))
-            unit = m.group(2)
-            break
+            qty = to_float(m.group(1)); unit = m.group(2); break
 
-    # unit price & line total as subsequent standalone numbers
     unit_price = line_total = None
     if qty is not None:
         nums = []
@@ -166,31 +131,19 @@ def parse_item_block(block: str) -> Dict[str, Any]:
             if re.fullmatch(rf"{NUM_RE}", ln.replace(" ", "")):
                 nums.append(ln.replace(" ", ""))
         if len(nums) >= 2:
-            unit_price = to_float(nums[0])
-            line_total  = to_float(nums[1])
+            unit_price = to_float(nums[0]); line_total = to_float(nums[1])
 
-    # CoO
     coo = None
     for ln in lines:
         m = re.search(r"\bCoO\s*:\s*([A-Z]{2,3})\b", ln, re.IGNORECASE)
-        if m:
-            coo = m.group(1).upper()
-            break
+        if m: coo = m.group(1).upper(); break
 
-    # HT codes (count everything like "XX HT: <code>")
     ht_codes = re.findall(r"\b[A-Z]{2}\s+HT\s*:\s*([0-9A-Za-z]+)", block, re.IGNORECASE)
 
     return {
-        "seq": seq,
-        "part_number": part,
-        "description": desc,
-        "qty": qty,
-        "unit": unit,
-        "unit_price": unit_price,
-        "line_total": line_total,
-        "coo": coo,
-        "ht_codes": ht_codes,
-        "raw": block,
+        "seq": seq, "part_number": part, "description": desc,
+        "qty": qty, "unit": unit, "unit_price": unit_price, "line_total": line_total,
+        "coo": coo, "ht_codes": ht_codes, "raw": block,
     }
 
 def parse_items(text: str) -> List[Dict[str, Any]]:
@@ -200,29 +153,18 @@ def parse_items(text: str) -> List[Dict[str, Any]]:
 def parse_packaging(text: str) -> Dict[str, Any]:
     blk = between(text, r"^Packaging\s+details\b", r"^---|\Z")
     out = {"colli": None, "dims": None, "weight_kg": None}
-    if not blk:
-        return out
-
-    # Colli number after "Colli"
+    if not blk: return out
     m = re.search(r"(?m)^Colli\s*$", blk)
     tail = blk[m.end():] if m else blk
     m2 = re.search(r"\b(\d{6,})\b", tail)
-    if m2:
-        out["colli"] = m2.group(1)
-
-    # Dimensions "a x b x c [M]"
+    if m2: out["colli"] = m2.group(1)
     m3 = re.search(rf"({NUM_RE})\s*[x×]\s*({NUM_RE})\s*[x×]\s*({NUM_RE})\s*[mM]?\b", blk)
-    if m3:
-        out["dims"] = tuple(to_float(m3.group(i)) for i in (1, 2, 3))
-
-    # Weight "<num> KG"
+    if m3: out["dims"] = tuple(to_float(m3.group(i)) for i in (1,2,3))
     m4 = re.search(rf"({NUM_RE})\s*KG\b", blk, re.IGNORECASE)
-    if m4:
-        out["weight_kg"] = to_float(m4.group(1))
-
+    if m4: out["weight_kg"] = to_float(m4.group(1))
     return out
 
-# ─── CHECKS (YOUR RULES) ────────────────────────────────────────────────
+# ─── CHECKS ─────────────────────────────────────────────────────────────
 def check_invoice(text: str, filename_dn: Optional[str]) -> List[str]:
     issues: List[str] = []
 
@@ -233,17 +175,13 @@ def check_invoice(text: str, filename_dn: Optional[str]) -> List[str]:
     document = parse_document(text)
     currency = parse_currency(text)
 
-    if not sold.strip():
-        issues.append("Sold to: block missing.")
-    if not incoterm:
-        issues.append("Incoterms: missing or malformed (need first word below).")
-    if not document:
-        issues.append("Document: DN number missing.")
+    if not sold.strip(): issues.append("Sold to: block missing.")
+    if not incoterm:    issues.append("Incoterms: missing or malformed (need first word below).")
+    if not document:    issues.append("Document: DN number missing.")
     else:
         if filename_dn and document != filename_dn:
             issues.append(f"Document: DN {document} ≠ filename {filename_dn}.")
-    if not currency:
-        issues.append("Currency: missing 'Currency: XXX' line.")
+    if not currency:    issues.append("Currency: missing 'Currency: XXX' line.")
 
     items = parse_items(text)
     if not items:
@@ -251,51 +189,37 @@ def check_invoice(text: str, filename_dn: Optional[str]) -> List[str]:
     else:
         for it in items:
             tag = f"Item {it.get('seq') or '?'} ({it.get('part_number') or 'unknown'})"
-
-            if it["qty"] is None:
-                issues.append(f"{tag}: Qty missing.")
-            if it["unit_price"] is None:
-                issues.append(f"{tag}: Unit Price missing.")
+            if it["qty"] is None: issues.append(f"{tag}: Qty missing.")
+            if it["unit_price"] is None: issues.append(f"{tag}: Unit Price missing.")
             else:
                 up = round(it["unit_price"], 2)
                 if up in FORBIDDEN_UNIT_PRICES:
                     issues.append(f"{tag}: Unit Price is {up:.2f} (forbidden: 0, 0.10, 0.11).")
-            if it["line_total"] is None:
-                issues.append(f"{tag}: Line total missing.")
+            if it["line_total"] is None: issues.append(f"{tag}: Line total missing.")
             if all(v is not None for v in (it["qty"], it["unit_price"], it["line_total"])):
                 calc = round(it["qty"] * it["unit_price"], 2)
                 if abs(calc - round(it["line_total"], 2)) > 0.02:
                     issues.append(f"{tag}: Qty × Unit Price ({calc:.2f}) ≠ Line Total ({it['line_total']:.2f}).")
-
             if need_asml_rules:
-                if not it["coo"]:
-                    issues.append(f"{tag}: CoO missing (required when Sold to contains ASML).")
+                if not it["coo"]: issues.append(f"{tag}: CoO missing (required when Sold to contains ASML).")
                 if len(it["ht_codes"]) < 2:
                     issues.append(f"{tag}: Fewer than two HT codes (found {len(it['ht_codes'])}).")
 
     pkg = parse_packaging(text)
-    if not pkg["colli"]:
-        issues.append("Packaging: Colli number missing.")
-    if not pkg["dims"]:
-        issues.append("Packaging: Dimensions missing.")
-    if not pkg["weight_kg"]:
-        issues.append("Packaging: Weight missing.")
+    if not pkg["colli"]:     issues.append("Packaging: Colli number missing.")
+    if not pkg["dims"]:      issues.append("Packaging: Dimensions missing.")
+    if not pkg["weight_kg"]: issues.append("Packaging: Weight missing.")
 
-    # Heuristics for anomalies
-    dims = pkg["dims"]
-    w = pkg["weight_kg"]
+    dims = pkg["dims"]; w = pkg["weight_kg"]
     if dims:
         L, W, H = dims
         for d in dims:
-            if d is not None and (d > 3.0 or d < 0.03):  # >3 m or <3 cm looks wrong
+            if d is not None and (d > 3.0 or d < 0.03):
                 issues.append(f"Packaging: Dimension {d} m looks abnormal.")
         if w is not None:
-            max_dim = max(L, W, H)
-            second = sorted(dims)[-2]
-            # ≥15 kg should not be a small box
+            max_dim = max(L, W, H); second = sorted(dims)[-2]
             if w >= 15 and max_dim <= 0.8 and second <= 0.6:
                 issues.append("Packaging: ≥15 kg should not be in a small box (expect pallet-like dimensions).")
-            # very large but very light
             if max_dim >= 1.5 and w <= 2:
                 issues.append("Packaging: Very large dimensions with very low weight — verify.")
 
@@ -303,56 +227,44 @@ def check_invoice(text: str, filename_dn: Optional[str]) -> List[str]:
 
 # ─── UI ─────────────────────────────────────────────────────────────────
 def popup(title: str, msg: str):
-    try:
-        ctypes.windll.user32.MessageBoxW(0, msg, title, 0x30)
-    except Exception:
-        logging.warning("Popup failed (non-Windows env?): %s", title)
+    try: ctypes.windll.user32.MessageBoxW(0, msg, title, 0x30)
+    except Exception: logging.warning("Popup failed (non-Windows env?): %s", title)
 
 # ─── FILE STABILITY ─────────────────────────────────────────────────────
 def wait_for_stable(path: str) -> bool:
     last, stable = -1, 0
     deadline = time.time() + TIMEOUT
     while time.time() < deadline:
-        try:
-            sz = os.path.getsize(path)
-        except Exception:
-            sz = -1
+        try: sz = os.path.getsize(path)
+        except Exception: sz = -1
         if sz == last and sz > 0:
             stable += 1
-            if stable >= STABLE_POLLS:
-                return True
+            if stable >= STABLE_POLLS: return True
         else:
-            stable = 0
-            last = sz
+            stable = 0; last = sz
         time.sleep(POLL_INTERVAL)
     return False
 
 # ─── WATCHER ────────────────────────────────────────────────────────────
 class Handler(FileSystemEventHandler):
-    def __init__(self):
-        self._seen = set()
+    def __init__(self): self._seen = set()
 
     def _try_process(self, path: str):
         fname = os.path.basename(path)
-        if not FILENAME_REGEX.match(fname) or path in self._seen:
-            return
+        if not FILENAME_REGEX.match(fname) or path in self._seen: return
         logging.info(f"→ Candidate detected: {fname}")
         if not wait_for_stable(path):
-            logging.error(f"File never stabilized: {fname}")
-            return
+            logging.error(f"File never stabilized: {fname}"); return
 
-        self._seen.add(path)
-        logging.info(f"Processing {fname}…")
+        self._seen.add(path); logging.info(f"Processing {fname}…")
         try:
             text = extract_text(path)
             if len(text.strip()) < 30:
                 popup("Invoice Warning", f"{fname}: very little text (scanned PDF?).")
                 logging.warning("%s looks scanned (no text).", fname)
 
-            # filename DN check
             base = os.path.splitext(fname)[0]
             filename_dn = base if re.fullmatch(r"\d{8}", base) else None
-
             issues = check_invoice(text, filename_dn)
 
             if WRITE_JSON_REPORT:
@@ -384,24 +296,17 @@ class Handler(FileSystemEventHandler):
             popup("Invoice Error", f"{fname} error:\n{e}")
 
     def on_created(self, event):
-        if not event.is_directory:
-            self._try_process(event.src_path)
-
+        if not event.is_directory: self._try_process(event.src_path)
     def on_moved(self, event):
-        if not event.is_directory:
-            self._try_process(event.dest_path)
+        if not event.is_directory: self._try_process(event.dest_path)
 
 def main():
     if not os.path.isdir(DOWNLOADS_FOLDER):
-        logging.error(f"Downloads not found: {DOWNLOADS_FOLDER}")
-        return
-    obs = Observer()
-    obs.schedule(Handler(), DOWNLOADS_FOLDER, recursive=False)
-    obs.start()
-    logging.info("Watching for 8-digit PDFs in:\n  " + DOWNLOADS_FOLDER)
+        logging.error(f"Downloads not found: {DOWNLOADS_FOLDER}"); return
+    obs = Observer(); obs.schedule(Handler(), DOWNLOADS_FOLDER, recursive=False)
+    obs.start(); logging.info("Watching for 8-digit PDFs in:\n  " + DOWNLOADS_FOLDER)
     try:
-        while True:
-            time.sleep(1)
+        while True: time.sleep(1)
     except KeyboardInterrupt:
         obs.stop()
     obs.join()
