@@ -45,6 +45,8 @@ def extract_text(pdf_path: str) -> str:
                 f.write(text)
         except Exception as e:
             logging.warning("Couldn't write debug dump: %s", e)
+    # normalize NBSP and thin spaces so regex sees clean numbers/words
+    text = text.replace("\u00A0", " ").replace("\u202F", " ")
     return text
 
 # ─── HELPERS ────────────────────────────────────────────────────────────
@@ -60,6 +62,10 @@ def to_float(s: Optional[str]) -> Optional[float]:
             s = s.replace(",", "")
     try: return float(s)
     except Exception: return None
+
+def _strip_all_spaces(s: str) -> str:
+    # remove normal spaces, NBSP, thin spaces, tabs, etc.
+    return re.sub(r"[\s\u00A0\u202F]+", "", s)
 
 def between(text: str, start_pat: str, end_pat: str) -> Optional[str]:
     flags = re.IGNORECASE | re.MULTILINE | re.DOTALL
@@ -85,26 +91,41 @@ def sold_to_has_asml(sold_to: str) -> bool:
     return "ASML" in (sold_to or "").upper()
 
 def guess_country_from_sold_to(sold_to: str) -> Optional[str]:
-    """Heuristic: search for any known country token; else take last non-empty line."""
-    if not sold_to: return None
-    caps = clean_caps(sold_to)
-    # fast path: explicit EU tokens
+    """Pick country from the bottom of the Sold-to block using word-boundary matches.
+       Looks at last 3 lines; falls back to last non-empty line (trim after comma)."""
+    if not sold_to:
+        return None
+
+    lines = [ln.strip() for ln in sold_to.splitlines() if ln.strip()]
+    tail = [l.upper() for l in lines[-3:]]
+
+    # 1) Prefer explicit EU names from your EU_ALIASES set
     for token in sorted(EU_ALIASES, key=len, reverse=True):
-        if token in caps:
-            return token
-    # some common non-EU quick hits
-    NON_EU_HINTS = ["UNITED KINGDOM","UK","NORWAY","SWITZERLAND","ICELAND",
-                    "TURKEY","SERBIA","ALBANIA","NORTH MACEDONIA","MOLDOVA",
-                    "UKRAINE","BELARUS","RUSSIA","UNITED STATES","USA","US",
-                    "CANADA","MEXICO","BRAZIL","CHINA","TAIWAN","JAPAN",
-                    "SINGAPORE","MALAYSIA","INDIA","UNITED ARAB EMIRATES","UAE",
-                    "SAUDI ARABIA","ISRAEL","SOUTH AFRICA","AUSTRALIA","NEW ZEALAND"]
-    for t in NON_EU_HINTS:
-        if t in caps: return t
-    # fallback: last non-empty line
-    lines = [ln.strip() for ln in (sold_to.splitlines()) if ln.strip()]
+        pat = r"\b" + re.escape(token) + r"\b"
+        for ln in tail:
+            if re.search(pat, ln):
+                return token
+
+    # 2) Common non-EU names with safe word boundaries (optional hints)
+    NON_EU_HINTS = [
+        "UNITED KINGDOM","NORTHERN IRELAND","UNITED STATES","UNITED ARAB EMIRATES","NEW ZEALAND",
+        "SOUTH AFRICA","SAUDI ARABIA","CZECH REPUBLIC","NORTH MACEDONIA","SWITZERLAND","ICELAND",
+        "NORWAY","TURKEY","SERBIA","ALBANIA","MOLDOVA","UKRAINE","BELARUS","RUSSIA","CANADA",
+        "MEXICO","BRAZIL","CHINA","TAIWAN","JAPAN","SINGAPORE","MALAYSIA","INDIA","ISRAEL",
+        "AUSTRALIA","HONG KONG","KOREA","KOREA REP","KOREA, REP"
+    ]
+    for token in NON_EU_HINTS:
+        pat = r"\b" + re.escape(token) + r"\b"
+        for ln in tail:
+            if re.search(pat, ln):
+                return token
+
+    # 3) Fallback: last non-empty line (often just the country), trim after comma
     if lines:
-        return clean_caps(lines[-1])
+        last = lines[-1].upper()
+        if "," in last:
+            last = last.split(",")[0]
+        return last
     return None
 
 def is_country_in_eu(country_name: Optional[str]) -> Optional[bool]:
@@ -158,12 +179,14 @@ def parse_item_block(block: str) -> Dict[str, Any]:
         m = re.search(rf"\b({NUM_RE})\s+([A-Z]{{1,4}})\b", ln)
         if m: qty = to_float(m.group(1)); unit = m.group(2); break
 
+    # unit price & line total as subsequent standalone numbers
     unit_price = line_total = None
     if qty is not None:
         nums = []
         for ln in lines:
-            if re.fullmatch(rf"{NUM_RE}", ln.replace(" ", "")):
-                nums.append(ln.replace(" ", ""))
+            s = _strip_all_spaces(ln)  # use robust whitespace stripper
+            if re.fullmatch(rf"{NUM_RE}", s):
+                nums.append(s)
         if len(nums) >= 2:
             unit_price = to_float(nums[0]); line_total = to_float(nums[1])
 
