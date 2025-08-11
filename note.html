@@ -59,15 +59,22 @@ def to_float(s: Optional[str]) -> Optional[float]:
         return None
 
 def between(text: str, start_pat: str, end_pat: str) -> Optional[str]:
-    m = re.search(start_pat, text, re.IGNORECASE | re.DOTALL)
-    if not m: return None
+    """Return substring between start_pat and end_pat using I|M|S flags."""
+    flags = re.IGNORECASE | re.MULTILINE | re.DOTALL
+    m = re.search(start_pat, text, flags)
+    if not m:
+        return None
     tail = text[m.end():]
-    m2 = re.search(end_pat, tail, re.IGNORECASE | re.DOTALL)
+    m2 = re.search(end_pat, tail, flags)
     return tail[:m2.start()] if m2 else tail
 
 # ─── TOP-LEVEL FIELDS ───────────────────────────────────────────────────
 def parse_sold_to(text: str) -> str:
-    blk = between(text, r"\bSold\s+to\b", r"\bDelivery\s+Ship\s+to\b|(?mi)^Item\s+Part\s+number\b|(?mi)^Incoterms\b|(?mi)^Ship\s+from\b")
+    blk = between(
+        text,
+        r"\bSold\s+to\b",
+        r"\bDelivery\s+Ship\s+to\b|^Item\s+Part\s+number\b|^Incoterms\b|^Ship\s+from\b"
+    )
     return (blk or "").strip()
 
 def sold_to_has_asml(sold_to: str) -> bool:
@@ -75,35 +82,39 @@ def sold_to_has_asml(sold_to: str) -> bool:
 
 def parse_incoterm(text: str) -> Optional[str]:
     # first word below "Incoterms"
-    line = between(text, r"(?mi)^Incoterms\b[^\n]*\n", r"\n")
+    line = between(text, r"^Incoterms\b[^\n]*\n", r"\n")
     if not line:
-        line = between(text, r"(?mi)^Incoterms\b\s*", r"\n")
-    if not line: return None
+        line = between(text, r"^Incoterms\b\s*", r"\n")
+    if not line:
+        return None
     return (line.strip().split() or [None])[0]
 
 def parse_document(text: str) -> Optional[str]:
-    line = between(text, r"(?mi)^Document\b[^\n]*\n", r"\n")
+    line = between(text, r"^Document\b[^\n]*\n", r"\n")
     if not line:
-        line = between(text, r"(?mi)^Document\b\s*", r"\n")
-    if not line: return None
+        line = between(text, r"^Document\b\s*", r"\n")
+    if not line:
+        return None
     m = re.search(r"\b\d{6,}\b", line)
     return m.group(0) if m else None
 
 def parse_currency(text: str) -> Optional[str]:
-    m = re.search(r"(?mi)^Currency\s*:\s*([A-Z]{3})\b", text)
+    m = re.search(r"^Currency\s*:\s*([A-Z]{3})\b", text, re.IGNORECASE | re.MULTILINE)
     return m.group(1).upper() if m else None
 
 # ─── ITEMS ──────────────────────────────────────────────────────────────
 def split_item_blocks(text: str) -> List[str]:
-    area = between(text, r"(?mi)^Item\s+Part\s+number\b", r"(?mi)^Total\s+Amount\b|(?mi)^Packaging\s+details\b|(?mi)^---")
+    area = between(text, r"^Item\s+Part\s+number\b", r"^Total\s+Amount\b|^Packaging\s+details\b|^---")
     if not area:
         return []
+    # find all item openings inside area
     starts = [m.start() for m in re.finditer(r"(?m)^\d{3}\s+\S+", area)]
     blocks = []
     for i, s in enumerate(starts):
         e = starts[i+1] if i+1 < len(starts) else len(area)
-        cut = re.search(r"(?mi)^Total\s+Amount\b|^Packaging\s+details\b|^---", area[s:e])
-        if cut: e = s + cut.start()
+        cut = re.search(r"(?m)^Total\s+Amount\b|^Packaging\s+details\b|^---", area[s:e])
+        if cut:
+            e = s + cut.start()
         blocks.append(area[s:e].strip())
     return blocks
 
@@ -133,18 +144,18 @@ def parse_item_block(block: str) -> Dict[str, Any]:
                 nums.append(ln.replace(" ", ""))
         if len(nums) >= 2:
             unit_price = to_float(nums[0])
-            line_total = to_float(nums[1])
+            line_total  = to_float(nums[1])
 
     # CoO
     coo = None
     for ln in lines:
-        m = re.search(r"(?i)\bCoO\s*:\s*([A-Z]{2,3})\b", ln)
+        m = re.search(r"\bCoO\s*:\s*([A-Z]{2,3})\b", ln, re.IGNORECASE)
         if m:
             coo = m.group(1).upper()
             break
 
     # HT codes (count everything like "XX HT: <code>")
-    ht_codes = re.findall(r"(?i)\b[A-Z]{2}\s+HT\s*:\s*([0-9A-Za-z]+)", block)
+    ht_codes = re.findall(r"\b[A-Z]{2}\s+HT\s*:\s*([0-9A-Za-z]+)", block, re.IGNORECASE)
 
     return {
         "seq": seq,
@@ -164,15 +175,17 @@ def parse_items(text: str) -> List[Dict[str, Any]]:
 
 # ─── PACKAGING ───────────────────────────────────────────────────────────
 def parse_packaging(text: str) -> Dict[str, Any]:
-    blk = between(text, r"(?mi)^Packaging\s+details\b", r"(?mi)^---|\Z")
+    blk = between(text, r"^Packaging\s+details\b", r"^---|\Z")
     out = {"colli": None, "dims": None, "weight_kg": None}
-    if not blk: return out
+    if not blk:
+        return out
 
     # Colli number after "Colli"
-    m = re.search(r"(?mi)^Colli\s*$", blk)
+    m = re.search(r"(?m)^Colli\s*$", blk)
     tail = blk[m.end():] if m else blk
     m2 = re.search(r"\b(\d{6,})\b", tail)
-    if m2: out["colli"] = m2.group(1)
+    if m2:
+        out["colli"] = m2.group(1)
 
     # Dimensions "a x b x c [M]"
     m3 = re.search(rf"({NUM_RE})\s*[x×]\s*({NUM_RE})\s*[x×]\s*({NUM_RE})\s*[mM]?\b", blk)
@@ -181,7 +194,8 @@ def parse_packaging(text: str) -> Dict[str, Any]:
 
     # Weight "<num> KG"
     m4 = re.search(rf"({NUM_RE})\s*KG\b", blk, re.IGNORECASE)
-    if m4: out["weight_kg"] = to_float(m4.group(1))
+    if m4:
+        out["weight_kg"] = to_float(m4.group(1))
 
     return out
 
@@ -305,7 +319,6 @@ class Handler(FileSystemEventHandler):
         logging.info(f"Processing {fname}…")
         try:
             text = extract_text(path)
-            # if almost no text → likely scanned PDF (needs OCR)
             if len(text.strip()) < 30:
                 popup("Invoice Warning", f"{fname}: very little text (scanned PDF?).")
                 logging.warning("%s looks scanned (no text).", fname)
