@@ -18,9 +18,11 @@ STABLE_POLLS  = 3
 POLL_INTERVAL = 0.10
 TIMEOUT       = 5.0
 
-WRITE_JSON_REPORT = True
+WRITE_JSON_REPORT = True     # write <file>.check.json
+DEBUG_DUMP = True            # write <file>.txt with extracted text
 LOGLEVEL = logging.INFO
 
+# forbidden unit prices
 FORBIDDEN_UNIT_PRICES = {0.0, 0.1, 0.11}
 
 # ─── LOGGING ─────────────────────────────────────────────────────────────
@@ -30,21 +32,30 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 
-# ─── PDF TEXT ────────────────────────────────────────────────────────────
+# ─── PDF → TEXT ─────────────────────────────────────────────────────────
 def extract_text(pdf_path: str) -> str:
+    """Return all text from PDF with page separators. Also dumps <pdf>.txt if DEBUG_DUMP."""
     doc = fitz.open(pdf_path)
     parts = []
     total = len(doc)
     for i, page in enumerate(doc, 1):
         parts.append(f"\n----- Page {i}/{total} -----\n{page.get_text('text')}")
     doc.close()
-    return "".join(parts)
+    text = "".join(parts)
+    if DEBUG_DUMP:
+        try:
+            with open(pdf_path + ".txt", "w", encoding="utf-8") as f:
+                f.write(text)
+        except Exception as e:
+            logging.warning("Couldn't write debug dump: %s", e)
+    return text
 
 # ─── PARSING HELPERS ────────────────────────────────────────────────────
 NUM_RE = r"[-+]?\d+(?:[.,]\d+)?"
 
 def to_float(s: Optional[str]) -> Optional[float]:
-    if not s: return None
+    if not s:
+        return None
     s = s.replace("\u00A0", " ").replace(" ", "")
     if "," in s and "." in s:
         s = s.replace(".", "").replace(",", ".") if s.rfind(",") > s.rfind(".") else s.replace(",", "")
@@ -104,15 +115,27 @@ def parse_currency(text: str) -> Optional[str]:
 
 # ─── ITEMS ──────────────────────────────────────────────────────────────
 def split_item_blocks(text: str) -> List[str]:
-    area = between(text, r"^Item\s+Part\s+number\b", r"^Total\s+Amount\b|^Packaging\s+details\b|^---")
+    """
+    Robust splitter:
+    1) Try the area between 'Item Part number' and an end marker.
+    2) If not found, scan the WHOLE text for numbered lines '^\d{3}\s+\S+'.
+    """
+    end_markers = r"^Total\s+Amount\b|^Packaging\s+details\b|^Total\s+Net\s+Weight\b|^Special\s+Packaging\b|^---"
+
+    area = between(text, r"^Item\s+Part\s+number\b", end_markers)
     if not area:
-        return []
-    # find all item openings inside area
+        area = between(text, r"^Item\s+.*Part\s+.*number\b", end_markers)
+    if not area:
+        area = text  # fallback
+
     starts = [m.start() for m in re.finditer(r"(?m)^\d{3}\s+\S+", area)]
-    blocks = []
+    if not starts:
+        return []
+
+    blocks: List[str] = []
     for i, s in enumerate(starts):
         e = starts[i+1] if i+1 < len(starts) else len(area)
-        cut = re.search(r"(?m)^Total\s+Amount\b|^Packaging\s+details\b|^---", area[s:e])
+        cut = re.search(end_markers, area[s:e], re.MULTILINE | re.IGNORECASE)
         if cut:
             e = s + cut.start()
         blocks.append(area[s:e].strip())
@@ -258,6 +281,7 @@ def check_invoice(text: str, filename_dn: Optional[str]) -> List[str]:
     if not pkg["weight_kg"]:
         issues.append("Packaging: Weight missing.")
 
+    # Heuristics for anomalies
     dims = pkg["dims"]
     w = pkg["weight_kg"]
     if dims:
@@ -268,8 +292,10 @@ def check_invoice(text: str, filename_dn: Optional[str]) -> List[str]:
         if w is not None:
             max_dim = max(L, W, H)
             second = sorted(dims)[-2]
+            # ≥15 kg should not be a small box
             if w >= 15 and max_dim <= 0.8 and second <= 0.6:
                 issues.append("Packaging: ≥15 kg should not be in a small box (expect pallet-like dimensions).")
+            # very large but very light
             if max_dim >= 1.5 and w <= 2:
                 issues.append("Packaging: Very large dimensions with very low weight — verify.")
 
@@ -323,7 +349,10 @@ class Handler(FileSystemEventHandler):
                 popup("Invoice Warning", f"{fname}: very little text (scanned PDF?).")
                 logging.warning("%s looks scanned (no text).", fname)
 
-            filename_dn = os.path.splitext(fname)[0] if re.fullmatch(r"\d{8}", os.path.splitext(fname)[0]) else None
+            # filename DN check
+            base = os.path.splitext(fname)[0]
+            filename_dn = base if re.fullmatch(r"\d{8}", base) else None
+
             issues = check_invoice(text, filename_dn)
 
             if WRITE_JSON_REPORT:
@@ -337,8 +366,11 @@ class Handler(FileSystemEventHandler):
                     "items": [ib for ib in parse_items(text)],
                     "issues": issues
                 }
-                with open(path + ".check.json", "w", encoding="utf-8") as f:
-                    json.dump(sidecar, f, indent=2, ensure_ascii=False)
+                try:
+                    with open(path + ".check.json", "w", encoding="utf-8") as f:
+                        json.dump(sidecar, f, indent=2, ensure_ascii=False)
+                except Exception as e:
+                    logging.warning("Couldn't write JSON sidecar: %s", e)
 
             if issues:
                 msg = f"Issues in {fname}:\n\n" + "\n".join(issues)
