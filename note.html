@@ -92,132 +92,57 @@ def click_leg_print_button(page):
     page.evaluate("() => (typeof clickGuiButton==='function') && clickGuiButton('BtnLegPrint')")
     log("Fallback: invoked clickGuiButton('BtnLegPrint').")
 
-# ---------- Popup A (toolbar with doPrint) ----------
-
-def wait_for_first_popup(context, page):
-    try:
-        popup = page.wait_for_event("popup", timeout=5000)
-        log("Popup A (toolbar) opened via event.")
-        return popup
-    except PWTimeout:
-        before = set(context.pages)
-        for _ in range(30):
-            time.sleep(0.15)
-            after = set(context.pages)
-            new_pages = list(after - before)
-            if new_pages:
-                log("Popup A (toolbar) detected via new-tab fallback.")
-                return new_pages[0]
-        raise RuntimeError("No popup detected after clicking Leg Print.")
-
-from playwright.sync_api import TimeoutError as PWTimeout
+# ---------- Robust doPrint + download capture (popup or context) ----------
 
 def click_do_print_and_get_download(context, popupA, timeout_ms=12000):
-   """
-   Robustly trigger the label print from Popup A and capture the resulting Download.
-   Some environments emit the Download from Popup A; others emit it on the BrowserContext.
-   We try both, without leaving dangling listeners.
-   Returns: playwright Download object or None.
-   """
-   popupA.bring_to_front()
-   try:
-       popupA.wait_for_load_state("domcontentloaded", timeout=4000)
-   except Exception:
-       pass
+    """
+    Trigger doPrint() from Popup A and capture the resulting Download.
+    Works whether the download is attached to the popup or to the browser context.
+    Returns a playwright Download object, or None on failure.
+    """
+    popupA.bring_to_front()
+    try:
+        popupA.wait_for_load_state("domcontentloaded", timeout=4000)
+    except Exception:
+        pass
 
-   # Helper to trigger doPrint (with a toolbar fallback)
-   def _fire_print():
-       try:
-           if popupA.evaluate("() => typeof doPrint === 'function'"):
-               popupA.evaluate("() => doPrint()")
-               return True
-       except Exception:
-           pass
-       try:
-           # fallback toolbar element
-           loc = popupA.locator("a[onclick*='doPrint'], a.locale-icon-print, span[title='Print']").first
-           if loc.count():
-               loc.click()
-               return True
-       except Exception:
-           pass
-       return False
-
-   # 1) Try capturing download directly from Popup A
-   try:
-       with popupA.expect_download(timeout=timeout_ms) as dl_info:
-           _ = _fire_print()  # trigger print (ignore boolean result)
-       return dl_info.value
-   except PWTimeout:
-       pass  # fall through and try context-level
-   except Exception:
-       pass
-
-   # 2) Some sites attach the download to the *context* rather than the popup
-   try:
-       with context.expect_event("download", timeout=timeout_ms) as ev_info:
-           _ = _fire_print()  # trigger again in case previous didn’t fire
-       return ev_info.value
-   except PWTimeout:
-       return None
-   except Exception:
-       return None
-
-
-def wait_for_label_view_after_do_print(context, popupA, timeout_ms=5000):
-   """
-   Keep this for completeness if you still need a handle to the label tab,
-   but most flows can skip it once we capture the Download.
-   """
-   try:
-       popupB = popupA.wait_for_event("popup", timeout=timeout_ms)
-       try:
-           popupB.wait_for_load_state("load", timeout=timeout_ms)
-       except Exception:
-           pass
-       return popupB
-   except Exception:
-       pass
-
-   before = set(context.pages)
-   for _ in range(int(timeout_ms / 150)):
-       time.sleep(0.15)
-       after = set(context.pages)
-       new_pages = list(after - before)
-       if new_pages:
-           popupB = new_pages[0]
-           try:
-               popupB.wait_for_load_state("load", timeout=timeout_ms)
-           except Exception:
-               pass
-           return popupB
-
-   # If nothing popped, just return Popup A (some viewers render inline)
-   return popupA
-
-# ---------- Browser print (kept, though we now use Sumatra) ----------
-
-def print_all_copies(label_page, copies: int):
-    for _ in range(copies):
+    def _fire_print():
         try:
-            label_page.evaluate("() => window.print && window.print()")
+            if popupA.evaluate("() => typeof doPrint === 'function'"):
+                popupA.evaluate("() => doPrint()")
+                return True
         except Exception:
-            # try sub-frames too
-            done = False
-            for f in label_page.frames:
-                if f == label_page.main_frame: continue
-                try:
-                    f.evaluate("() => window.print && window.print()")
-                    done = True
-                    break
-                except:
-                    continue
-            if not done:
-                log("Warning: window.print() failed on label page.")
-        time.sleep(0.4)
-    log(f"Requested {copies} copy/copies (all pages).")
+            pass
+        try:
+            loc = popupA.locator("a[onclick*='doPrint'], a.locale-icon-print, span[title='Print']").first
+            if loc.count():
+                loc.click()
+                return True
+        except Exception:
+            pass
+        return False
 
-# ---------- PDF acquisition helpers ----------
+    # 1) Prefer popup-level download
+    try:
+        with popupA.expect_download(timeout=timeout_ms) as dl_info:
+            _fire_print()
+        return dl_info.value
+    except PWTimeout:
+        pass
+    except Exception:
+        pass
+
+    # 2) Fallback: some sites attach download to the context
+    try:
+        with context.expect_event("download", timeout=timeout_ms) as ev_info:
+            _fire_print()
+        return ev_info.value
+    except PWTimeout:
+        return None
+    except Exception:
+        return None
+
+# ---------- PDF acquisition helpers (kept for fallbacks) ----------
 
 def try_request_pdf_via_context(context, label_page) -> Optional[bytes]:
     """Fetch the label PDF with APIRequestContext (cookie-aware)."""
@@ -254,7 +179,7 @@ def try_fetch_pdf_bytes_direct(label_page) -> Optional[bytes]:
                     const buf = await r.arrayBuffer();
                     const arr = new Uint8Array(buf);
                     let bin = '';
-                    for (let i=0; i<arr.length; i++) bin += String.fromCharCode(arr[i]);
+                    for (let i=0; i<arr.length; i++) bin += String.fromCharCode(i[arr]);
                     return btoa(bin);
                 } catch(e) { return null; }
             }""",
@@ -265,25 +190,14 @@ def try_fetch_pdf_bytes_direct(label_page) -> Optional[bytes]:
     except Exception:
         return None
 
-def try_click_download_and_get_pdf_bytes(label_page) -> Optional[bytes]:
-    """Fallback: try a download button in the viewer (often not present)."""
-    selectors = [
-        "cr-icon-button[aria-label='Download']",
-        "cr-icon-button[title='Download']",
-        "button[title='Download']",
-        "a[title='Download']",
-        "span[title='Download']",
-        "a:has-text('Download')",
-        "a[onclick*='download']",
-        "button[onclick*='download']",
-        "button#save",
-    ]
+def try_click_download_and_get_pdf_bytes(context, popupA) -> Optional[bytes]:
+    """
+    Use the unified doPrint+download capture and return bytes.
+    """
     try:
-# NEW
         dl = click_do_print_and_get_download(context, popupA, timeout_ms=12000)
         if not dl:
-            log("No download event captured after doPrint().")
-            return  # or handle fallback as you prefer
+            return None
         tmp_dir = os.path.join(os.getcwd(), "_alpega_tmp")
         os.makedirs(tmp_dir, exist_ok=True)
         path = os.path.join(tmp_dir, dl.suggested_filename or "label.pdf")
@@ -293,7 +207,7 @@ def try_click_download_and_get_pdf_bytes(label_page) -> Optional[bytes]:
         log(f"Downloaded label file: {os.path.basename(path)} ({len(data)} bytes).")
         return data
     except Exception as e:
-        log(f"Download attempt failed: {e}")
+        log(f"Download capture failed: {e}")
         return None
 
 def try_capture_pdf_via_reload(label_page, context, timeout_ms=9000) -> Optional[bytes]:
@@ -313,6 +227,7 @@ def try_capture_pdf_via_reload(label_page, context, timeout_ms=9000) -> Optional
             pass
 
     label_page.on("response", _on_response)
+    remove_listener = None
     if hasattr(label_page, "off"):
         remove_listener = lambda: label_page.off("response", _on_response)
     elif hasattr(label_page, "remove_listener"):
@@ -335,33 +250,17 @@ def try_capture_pdf_via_reload(label_page, context, timeout_ms=9000) -> Optional
         try: remove_listener()
         except: pass
 
-# ---------- Preferred FedEx path: real download via doPrint ----------
+# ---------- Preferred FedEx path: direct doPrint download ----------
 
-def fedex_try_download_via_doPrint(popupA) -> Optional[bytes]:
+def fedex_try_download_via_doPrint(context, popupA) -> Optional[bytes]:
     """
-    If Edge is set to 'Always download PDF files', doPrint() triggers a real download.
-    Capture it and return bytes.
+    Trigger doPrint and capture the real downloaded file (Edge 'Always download PDF files').
     """
     try:
-        popupA.bring_to_front()
-        try:
-            popupA.wait_for_load_state("domcontentloaded", timeout=4000)
-        except:
-            pass
-        with popupA.expect_download(timeout=10000) as dl_info:
-            # Trigger doPrint (or toolbar anchor)
-            try:
-                if popupA.evaluate("() => typeof doPrint === 'function'"):
-                    popupA.evaluate("() => doPrint()")
-                else:
-                    loc = popupA.locator("a[onclick*='doPrint'], a.locale-icon-print, span[title='Print']").first
-                    if loc.count():
-                        loc.click()
-                    else:
-                        popupA.evaluate("() => { if (typeof doPrint==='function') doPrint(); }")
-            except:
-                pass
-        dl = dl_info.value
+        dl = click_do_print_and_get_download(context, popupA, timeout_ms=12000)
+        if not dl:
+            log("FedEx: doPrint download not captured.")
+            return None
         tmp = os.path.join(os.getcwd(), "_alpega_tmp")
         os.makedirs(tmp, exist_ok=True)
         path = os.path.join(tmp, dl.suggested_filename or "DispoPrint.pdf")
@@ -371,7 +270,7 @@ def fedex_try_download_via_doPrint(popupA) -> Optional[bytes]:
         log(f"FedEx: downloaded label via doPrint: {os.path.basename(path)} ({len(data)} bytes).")
         return data
     except Exception as e:
-        log(f"FedEx: doPrint download path not available ({e}).")
+        log(f"FedEx: doPrint download path failed ({e}).")
         return None
 
 # ---------- Split & PRINT (Sumatra) helpers ----------
@@ -410,7 +309,7 @@ def silent_print(pdf_path, copies=1):
             )
         except Exception as e:
             log(f"Sumatra print failed: {e}")
-        time.sleep(0.2)
+        time.sleep(0.15)
     log(f"Sent {copies} copy/copies to printer silently (Simplex).")
 
 def save_pdf_bytes_as(path: str, data: bytes):
@@ -420,8 +319,7 @@ def save_pdf_bytes_as(path: str, data: bytes):
 
 def open_data_pdf_and_print(context, name: str, pdf_bytes: bytes, copies: int):
     """
-    CHANGED: save the PDF and print silently with SumatraPDF (single-sided),
-    instead of opening in the browser/Acrobat.
+    Save the PDF and print silently with SumatraPDF (single-sided).
     """
     tmp_dir = os.path.join(os.getcwd(), "_alpega_tmp")
     os.makedirs(tmp_dir, exist_ok=True)
@@ -437,32 +335,26 @@ def fedex_print_with_ranges(context, label_page, popupA, dn_number: str):
     FedEx:
       - print pages 1–2 twice
       - print pages 5..end once (skip 3–4)
-    1) Prefer real file via doPrint() download; fallbacks kept for safety.
-    2) Print via Sumatra silently.
+    Preferred: capture real file via doPrint() download; fall back to other methods if needed.
     """
-    # 0) Preferred: real browser download via doPrint
     log("FedEx: trying doPrint() → real download path.")
-    pdf_bytes = fedex_try_download_via_doPrint(popupA)
+    pdf_bytes = fedex_try_download_via_doPrint(context, popupA)
 
-    # 1) Context request (cookie-aware)
     if not pdf_bytes:
         log("FedEx: trying context.request() …")
         pdf_bytes = try_request_pdf_via_context(context, label_page)
 
-    # 2) Reload capture
     if not pdf_bytes:
         log("FedEx: trying reload network capture …")
         pdf_bytes = try_capture_pdf_via_reload(label_page, context, timeout_ms=9000)
 
-    # 3) In-page fetch
     if not pdf_bytes:
         log("FedEx: trying in-page fetch (may be CORS‑blocked) …")
         pdf_bytes = try_fetch_pdf_bytes_direct(label_page)
 
-    # 4) Viewer Download control
     if not pdf_bytes:
         log("FedEx: trying viewer Download control …")
-        pdf_bytes = try_click_download_and_get_pdf_bytes(label_page)
+        pdf_bytes = try_click_download_and_get_pdf_bytes(context, popupA)
 
     if not pdf_bytes:
         log("FedEx: could not obtain PDF by any method. Stopping FedEx range prints.")
@@ -507,6 +399,7 @@ def main():
         if not browser.contexts:
             raise RuntimeError("No contexts found. Start Edge with --remote-debugging-port + --kiosk-printing.")
         context = browser.contexts[0]
+
         page = get_current_order_page(context)
         if not page:
             raise RuntimeError("No open order detail tab found (SendungBearbeitung). Open the order first.")
@@ -521,24 +414,34 @@ def main():
         def run_doc(value: str, copies: int, fedex_mode: bool = False):
             select_document(page, value)
             click_leg_print_button(page)
-            popupA = wait_for_first_popup(context, page)
-            if not click_do_print_in_popupA(popupA):
-                log("Failed to trigger doPrint() in Popup A; skipping.")
-                return
-            label_page = wait_for_label_view_after_do_print(context, popupA)
+            # Popup A (toolbar)
+            try:
+                popupA = page.wait_for_event("popup", timeout=6000)
+                log("Popup A detected.")
+            except PWTimeout:
+                # fallback detect
+                before = set(context.pages)
+                time.sleep(0.2)
+                after = set(context.pages)
+                new_pages = list(after - before)
+                popupA = new_pages[0] if new_pages else page
+                log("Popup A fallback in use.")
+
             if fedex_mode:
+                # FedEx: split & print with ranges
+                label_page = popupA  # for fallbacks that need a page
                 fedex_print_with_ranges(context, label_page, popupA, dn_number)
             else:
-                # generic: download via doPrint and print silently (single-sided)
-                pdf_bytes = fedex_try_download_via_doPrint(popupA)
-                if pdf_bytes:
-                    out_dir = os.path.join(os.getcwd(), "_alpega_tmp")
-                    os.makedirs(out_dir, exist_ok=True)
-                    out_path = os.path.join(out_dir, f"{dn_number}.pdf")
-                    save_pdf_bytes_as(out_path, pdf_bytes)
-                    silent_print(out_path, copies)
-                else:
-                    log("Could not obtain PDF for generic print; skipping.")
+                # Generic: trigger doPrint and capture the download, then print silently
+                dl = click_do_print_and_get_download(context, popupA, timeout_ms=12000)
+                if not dl:
+                    log("Generic print: no download captured; skipping.")
+                    return
+                out_dir = os.path.join(os.getcwd(), "_alpega_tmp")
+                os.makedirs(out_dir, exist_ok=True)
+                out_path = os.path.join(out_dir, f"{dn_number}.pdf")
+                dl.save_as(out_path)
+                silent_print(out_path, copies)
 
         if fwd == "FEDEX":
             run_doc("LABELXXQQXXlabelFedExWeb", copies=1, fedex_mode=True)
@@ -582,14 +485,16 @@ def main():
             log("Unknown forwarder. No documents printed.")
 
         log("Done.")
-    try:
-        context.close()
-    except Exception:
-        pass
-    try:
-        browser.close()
-    except Exception:
-        pass
+
+        # ✅ Cleanup inside the `with` block so next run works without Edge restart
+        try:
+            context.close()
+        except Exception:
+            pass
+        try:
+            browser.close()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main()
