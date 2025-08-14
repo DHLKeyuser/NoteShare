@@ -1,3 +1,5 @@
+# file: alpega_phase2_print_attach_edge.py
+
 import argparse
 import base64
 import io
@@ -9,18 +11,20 @@ from typing import Optional, List
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 from PyPDF2 import PdfReader, PdfWriter
 
-SUMATRA_PATH = r"C:\Users\tamolnar\Documents\SumatraPDF-3.5.2-64\SumatraPDF.exe"
 DETAIL_PATH_KEY = "/ls/vsa/servlet/SendungBearbeitung"
+SUMATRA_PATH = r"C:\Users\tamolnar\Documents\SumatraPDF-3.5.2-64\SumatraPDF.exe"
 
 def log(m): print(f"[phase2] {m}", flush=True)
 
 # ---------- Context / page helpers ----------
+
 def get_current_order_page(context) -> Optional[object]:
     for p in context.pages:
         try:
-            if not p.is_closed() and DETAIL_PATH_KEY in (p.url or ""):
+            if p.is_closed(): continue
+            if DETAIL_PATH_KEY in (p.url or ""):
                 return p
-        except:
+        except Exception:
             pass
     return None
 
@@ -28,9 +32,23 @@ def ensure_detail_ready(page):
     page.bring_to_front()
     page.locator("#elmtKopf\\.Geschaeftsfall").wait_for(state="attached", timeout=8000)
 
+def get_sendung_number(page) -> Optional[str]:
+    """Read SendungNrDfue -> e.g. '10069357' (used for filenames)."""
+    try:
+        loc = page.locator("input[name='SendungNrDfue']")
+        if loc.count():
+            val = loc.first.input_value().strip()
+            if val: return val
+        val2 = page.locator("div.input-disabled i").first.inner_text().strip()
+        return val2 if val2 else None
+    except Exception:
+        return None
+
 # ---------- Forwarder detection ----------
+
 def detect_forwarder(page) -> str:
     legs_tbl = page.locator("#TableLegs")
+    text = ""
     if legs_tbl.count() > 0:
         legs_tbl.wait_for(state="visible", timeout=8000)
         text = legs_tbl.inner_text().lower()
@@ -39,18 +57,20 @@ def detect_forwarder(page) -> str:
         rows.first.wait_for(state="visible", timeout=8000)
         text = "\n".join(rows.all_text_contents()).lower()
 
-    if "fedex" in text: return "FEDEX"
-    if "dsv" in text and "air" in text: return "DSV-AIR"
-    if "dsv" in text and "road" in text: return "DSV-ROAD"
-    if "dhl express" in text: return "DHL-EXP"
-    if "maersk" in text: return "MAERSK"
-    if "tromp" in text: return "TROMP"
-    if any(x in text for x in ["boogard", "boogaard", "vdb"]): return "VDB"
-    if any(x in text for x in ["kuehne", "kühne", "kuehne nagel", "kuehne+nagel", "knn"]): return "KNN"
-    if "dhl" in text: return "DGF"
+    t = text
+    if "fedex" in t: return "FEDEX"
+    if "dsv" in t and "air" in t: return "DSV-AIR"
+    if "dsv" in t and "road" in t: return "DSV-ROAD"
+    if "dhl express" in t: return "DHL-EXP"
+    if "maersk" in t: return "MAERSK"
+    if "tromp" in t: return "TROMP"
+    if any(x in t for x in ["boogard", "boogaard", "vdb"]): return "VDB"
+    if any(x in t for x in ["kuehne", "kühne", "kuehne nagel", "kuehne+nagel", "knn"]): return "KNN"
+    if "dhl" in t: return "DGF"  # generic -> DGF
     return "UNKNOWN"
 
 # ---------- Document select + correct print button ----------
+
 def select_document(page, value: str):
     sel = page.locator("#elmtLeg\\.DokumenteDokumente")
     sel.wait_for(state="visible", timeout=6000)
@@ -67,15 +87,18 @@ def click_leg_print_button(page):
     if btn.count():
         btn.first.scroll_into_view_if_needed()
         btn.first.click()
-        log("Clicked Leg Print button.")
+        log("Clicked Leg Print button within document area.")
         return
     page.evaluate("() => (typeof clickGuiButton==='function') && clickGuiButton('BtnLegPrint')")
-    log("Fallback: clickGuiButton('BtnLegPrint').")
+    log("Fallback: invoked clickGuiButton('BtnLegPrint').")
 
-# ---------- Popup handling ----------
+# ---------- Popup A (toolbar with doPrint) ----------
+
 def wait_for_first_popup(context, page):
     try:
-        return page.wait_for_event("popup", timeout=5000)
+        popup = page.wait_for_event("popup", timeout=5000)
+        log("Popup A (toolbar) opened via event.")
+        return popup
     except PWTimeout:
         before = set(context.pages)
         for _ in range(30):
@@ -83,8 +106,9 @@ def wait_for_first_popup(context, page):
             after = set(context.pages)
             new_pages = list(after - before)
             if new_pages:
+                log("Popup A (toolbar) detected via new-tab fallback.")
                 return new_pages[0]
-        raise RuntimeError("No popup detected.")
+        raise RuntimeError("No popup detected after clicking Leg Print.")
 
 def click_do_print_in_popupA(popup):
     popup.bring_to_front()
@@ -92,125 +116,468 @@ def click_do_print_in_popupA(popup):
         popup.wait_for_load_state("domcontentloaded", timeout=4000)
     except:
         pass
-    try:
-        if popup.evaluate("() => typeof doPrint === 'function'"):
-            popup.evaluate("() => doPrint()")
-            return True
-        loc = popup.locator("a[onclick*='doPrint'], a.locale-icon-print").first
-        if loc.count():
-            loc.click()
-            return True
-    except:
-        pass
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        try:
+            has_do_print = popup.evaluate("() => typeof doPrint === 'function'")
+            if has_do_print:
+                try:
+                    popup.evaluate("() => doPrint()")
+                    log("Called doPrint() in Popup A via JS.")
+                    return True
+                except Exception:
+                    return True
+            # fallback toolbar element
+            try:
+                loc = popup.locator("a[onclick*='doPrint'], a.locale-icon-print, span[title='Print']").first
+                if loc.count():
+                    loc.click()
+                    log("Clicked toolbar Print in Popup A.")
+                    return True
+            except Exception:
+                pass
+        except Exception:
+            pass
+        time.sleep(0.15)
+    log("Could not trigger doPrint() in Popup A within timeout.")
     return False
 
 def wait_for_label_view_after_do_print(context, popupA):
     try:
-        return popupA.wait_for_event("popup", timeout=4000)
+        popupB = popupA.wait_for_event("popup", timeout=4000)
+        log("Popup B (label) opened via event.")
+        try: popupB.wait_for_load_state("load", timeout=6000)
+        except: pass
+        return popupB
+    except Exception:
+        pass
+
+    before = set(context.pages)
+    for _ in range(20):
+        time.sleep(0.15)
+        after = set(context.pages)
+        new_pages = list(after - before)
+        if new_pages:
+            popupB = new_pages[0]
+            log("Popup B (label) detected as a new tab.")
+            try: popupB.wait_for_load_state("load", timeout=6000)
+            except: pass
+            return popupB
+
+    try:
+        url = (popupA.url or "").lower()
     except:
-        before = set(context.pages)
-        for _ in range(20):
-            time.sleep(0.15)
-            after = set(context.pages)
-            new_pages = list(after - before)
-            if new_pages:
-                return new_pages[0]
+        url = ""
+    if "pdf" in url or url.endswith(".pdf"):
+        log("Label appears to be loaded in Popup A (PDF URL).")
+        return popupA
+
+    log("Assuming label loaded in Popup A (no new popup detected).")
     return popupA
 
-# ---------- Silent printing ----------
-def silent_print(pdf_path, copies=1):
-    for _ in range(copies):
-        subprocess.run([SUMATRA_PATH, "-print-to-default", "-print-settings", "noscale,duplex=off", pdf_path],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    log(f"Sent {copies} copy/copies to printer silently (no duplex).")
+# ---------- Browser print (kept, though we now use Sumatra) ----------
 
-# ---------- FedEx special ----------
-def fedex_print_with_ranges(pdf_bytes: bytes, dn_number: str):
+def print_all_copies(label_page, copies: int):
+    for _ in range(copies):
+        try:
+            label_page.evaluate("() => window.print && window.print()")
+        except Exception:
+            # try sub-frames too
+            done = False
+            for f in label_page.frames:
+                if f == label_page.main_frame: continue
+                try:
+                    f.evaluate("() => window.print && window.print()")
+                    done = True
+                    break
+                except:
+                    continue
+            if not done:
+                log("Warning: window.print() failed on label page.")
+        time.sleep(0.4)
+    log(f"Requested {copies} copy/copies (all pages).")
+
+# ---------- PDF acquisition helpers ----------
+
+def try_request_pdf_via_context(context, label_page) -> Optional[bytes]:
+    """Fetch the label PDF with APIRequestContext (cookie-aware)."""
+    try:
+        url = label_page.url
+        if not url: return None
+        try:
+            ua = label_page.evaluate("() => navigator.userAgent") or "Mozilla/5.0"
+        except:
+            ua = "Mozilla/5.0"
+        headers = {
+            "Accept": "application/pdf,application/octet-stream;q=0.9,*/*;q=0.8",
+            "Referer": url,
+            "User-Agent": ua,
+        }
+        resp = context.request.get(url, headers=headers)
+        ctype = (resp.headers.get("content-type") or "").lower()
+        if not resp.ok or "application/pdf" not in ctype:
+            return None
+        return resp.body()
+    except Exception:
+        return None
+
+def try_fetch_pdf_bytes_direct(label_page) -> Optional[bytes]:
+    """In-page fetch (may be CORS-blocked by viewer)."""
+    try:
+        url = label_page.url
+        if not url: return None
+        b64 = label_page.evaluate(
+            """async (u) => {
+                try {
+                    const r = await fetch(u, {credentials:'include'});
+                    if (!r.ok) return null;
+                    const buf = await r.arrayBuffer();
+                    const arr = new Uint8Array(buf);
+                    let bin = '';
+                    for (let i=0; i<arr.length; i++) bin += String.fromCharCode(arr[i]);
+                    return btoa(bin);
+                } catch(e) { return null; }
+            }""",
+            url
+        )
+        if not b64: return None
+        return base64.b64decode(b64)
+    except Exception:
+        return None
+
+def try_click_download_and_get_pdf_bytes(label_page) -> Optional[bytes]:
+    """Fallback: try a download button in the viewer (often not present)."""
+    selectors = [
+        "cr-icon-button[aria-label='Download']",
+        "cr-icon-button[title='Download']",
+        "button[title='Download']",
+        "a[title='Download']",
+        "span[title='Download']",
+        "a:has-text('Download')",
+        "a[onclick*='download']",
+        "button[onclick*='download']",
+        "button#save",
+    ]
+    try:
+        with label_page.expect_download(timeout=6000) as dl_info:
+            clicked = False
+            for sel in selectors:
+                loc = label_page.locator(sel)
+                try:
+                    if loc.count():
+                        loc.first.scroll_into_view_if_needed()
+                        label_page.wait_for_timeout(100)
+                        try:
+                            loc.first.click()
+                        except Exception:
+                            try:
+                                label_page.evaluate("(el)=>el.click && el.click()", loc.first.element_handle())
+                            except Exception:
+                                continue
+                        log(f"Clicked download via selector: {sel}")
+                        clicked = True
+                        break
+                except Exception:
+                    continue
+            if not clicked:
+                log("No visible Download control found in label viewer.")
+                return None
+        dl = dl_info.value
+        tmp_dir = os.path.join(os.getcwd(), "_alpega_tmp")
+        os.makedirs(tmp_dir, exist_ok=True)
+        path = os.path.join(tmp_dir, dl.suggested_filename or "label.pdf")
+        dl.save_as(path)
+        with open(path, "rb") as f:
+            data = f.read()
+        log(f"Downloaded label file: {os.path.basename(path)} ({len(data)} bytes).")
+        return data
+    except Exception as e:
+        log(f"Download attempt failed: {e}")
+        return None
+
+def try_capture_pdf_via_reload(label_page, context, timeout_ms=9000) -> Optional[bytes]:
+    """Reload label page and capture the PDF response."""
+    pdf_blob = {"data": None}
+
+    def _on_response(resp):
+        try:
+            ctype = (resp.headers.get("content-type") or "").lower()
+            url = (resp.url or "").lower()
+            if ("application/pdf" in ctype) or url.endswith(".pdf") or ("dispoprint" in url):
+                if resp.request.frame == label_page.main_frame:
+                    body = resp.body()
+                    if body and len(body) > 0:
+                        pdf_blob["data"] = body
+        except Exception:
+            pass
+
+    label_page.on("response", _on_response)
+    if hasattr(label_page, "off"):
+        remove_listener = lambda: label_page.off("response", _on_response)
+    elif hasattr(label_page, "remove_listener"):
+        remove_listener = lambda: label_page.remove_listener("response", _on_response)
+    else:
+        remove_listener = lambda: None
+
+    try:
+        try:
+            label_page.reload(wait_until="load", timeout=timeout_ms)
+        except Exception:
+            pass
+        t0 = time.time()
+        while (time.time() - t0) < (timeout_ms / 1000):
+            if pdf_blob["data"]:
+                break
+            time.sleep(0.08)
+        return pdf_blob["data"]
+    finally:
+        try: remove_listener()
+        except: pass
+
+# ---------- Preferred FedEx path: real download via doPrint ----------
+
+def fedex_try_download_via_doPrint(popupA) -> Optional[bytes]:
+    """
+    If Edge is set to 'Always download PDF files', doPrint() triggers a real download.
+    Capture it and return bytes.
+    """
+    try:
+        popupA.bring_to_front()
+        try:
+            popupA.wait_for_load_state("domcontentloaded", timeout=4000)
+        except:
+            pass
+        with popupA.expect_download(timeout=10000) as dl_info:
+            # Trigger doPrint (or toolbar anchor)
+            try:
+                if popupA.evaluate("() => typeof doPrint === 'function'"):
+                    popupA.evaluate("() => doPrint()")
+                else:
+                    loc = popupA.locator("a[onclick*='doPrint'], a.locale-icon-print, span[title='Print']").first
+                    if loc.count():
+                        loc.click()
+                    else:
+                        popupA.evaluate("() => { if (typeof doPrint==='function') doPrint(); }")
+            except:
+                pass
+        dl = dl_info.value
+        tmp = os.path.join(os.getcwd(), "_alpega_tmp")
+        os.makedirs(tmp, exist_ok=True)
+        path = os.path.join(tmp, dl.suggested_filename or "DispoPrint.pdf")
+        dl.save_as(path)
+        with open(path, "rb") as f:
+            data = f.read()
+        log(f"FedEx: downloaded label via doPrint: {os.path.basename(path)} ({len(data)} bytes).")
+        return data
+    except Exception as e:
+        log(f"FedEx: doPrint download path not available ({e}).")
+        return None
+
+# ---------- Split & PRINT (Sumatra) helpers ----------
+
+def split_pdf_ranges(pdf_bytes: bytes, ranges: List[List[int]]) -> List[Optional[bytes]]:
+    outs = []
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    total = len(reader.pages)
+    for start, end in ranges:
+        s = max(1, start); e = min(total, end)
+        if s > e:
+            outs.append(None)
+            continue
+        writer = PdfWriter()
+        for p in range(s-1, e):
+            writer.add_page(reader.pages[p])
+        bio = io.BytesIO()
+        writer.write(bio)
+        outs.append(bio.getvalue())
+    return outs
+
+def silent_print(pdf_path, copies=1):
+    """Silent single-sided print via SumatraPDF to default printer."""
+    for _ in range(copies):
+        try:
+            subprocess.run(
+                [
+                    SUMATRA_PATH,
+                    "-print-to-default",
+                    "-print-settings", "noscale,duplexmode=Simplex",
+                    pdf_path
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False
+            )
+        except Exception as e:
+            log(f"Sumatra print failed: {e}")
+        time.sleep(0.2)
+    log(f"Sent {copies} copy/copies to printer silently (Simplex).")
+
+def save_pdf_bytes_as(path: str, data: bytes):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(data)
+
+def open_data_pdf_and_print(context, name: str, pdf_bytes: bytes, copies: int):
+    """
+    CHANGED: save the PDF and print silently with SumatraPDF (single-sided),
+    instead of opening in the browser/Acrobat.
+    """
     tmp_dir = os.path.join(os.getcwd(), "_alpega_tmp")
     os.makedirs(tmp_dir, exist_ok=True)
+    path = os.path.join(tmp_dir, f"{name}.pdf")
+    with open(path, "wb") as f:
+        f.write(pdf_bytes)
+    silent_print(path, copies)
+
+# ---------- FedEx page-range orchestrator ----------
+
+def fedex_print_with_ranges(context, label_page, popupA, dn_number: str):
+    """
+    FedEx:
+      - print pages 1–2 twice
+      - print pages 5..end once (skip 3–4)
+    1) Prefer real file via doPrint() download; fallbacks kept for safety.
+    2) Print via Sumatra silently.
+    """
+    # 0) Preferred: real browser download via doPrint
+    log("FedEx: trying doPrint() → real download path.")
+    pdf_bytes = fedex_try_download_via_doPrint(popupA)
+
+    # 1) Context request (cookie-aware)
+    if not pdf_bytes:
+        log("FedEx: trying context.request() …")
+        pdf_bytes = try_request_pdf_via_context(context, label_page)
+
+    # 2) Reload capture
+    if not pdf_bytes:
+        log("FedEx: trying reload network capture …")
+        pdf_bytes = try_capture_pdf_via_reload(label_page, context, timeout_ms=9000)
+
+    # 3) In-page fetch
+    if not pdf_bytes:
+        log("FedEx: trying in-page fetch (may be CORS‑blocked) …")
+        pdf_bytes = try_fetch_pdf_bytes_direct(label_page)
+
+    # 4) Viewer Download control
+    if not pdf_bytes:
+        log("FedEx: trying viewer Download control …")
+        pdf_bytes = try_click_download_and_get_pdf_bytes(label_page)
+
+    if not pdf_bytes:
+        log("FedEx: could not obtain PDF by any method. Stopping FedEx range prints.")
+        return
+
     reader = PdfReader(io.BytesIO(pdf_bytes))
     total = len(reader.pages)
 
-    def save_range(name, start, end):
-        writer = PdfWriter()
-        for p in range(start-1, min(end, total)):
-            writer.add_page(reader.pages[p])
-        path = os.path.join(tmp_dir, f"{dn_number}_{name}.pdf")
-        with open(path, "wb") as f:
-            writer.write(f)
-        return path
+    # pages 1–2 (x2)
+    part12 = split_pdf_ranges(pdf_bytes, [[1, min(2, total)]])[0]
+    if part12:
+        open_data_pdf_and_print(context, f"{dn_number}_pages1-2", part12, copies=2)
+    else:
+        log("FedEx: document has <1 page? Skipping 1–2 set.")
 
-    if total >= 2:
-        path12 = save_range("pages1-2", 1, 2)
-        silent_print(path12, copies=2)
+    # pages 5..end (x1)
     if total >= 5:
-        path5n = save_range("pages5-end", 5, total)
-        silent_print(path5n, copies=1)
+        part5n = split_pdf_ranges(pdf_bytes, [[5, total]])[0]
+        if part5n:
+            open_data_pdf_and_print(context, f"{dn_number}_pages5-end", part5n, copies=1)
+    else:
+        log("FedEx: document has <5 pages; skipping 5..end set.")
+
+# ---------- Placeholder flags (wire later) ----------
+
+def priority_is_S4() -> bool:
+    return False
+
+def is_outside_netherlands() -> bool:
+    return False
 
 # ---------- Main ----------
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--cdp", default="http://localhost:9222")
+    ap.add_argument("--cdp", default="http://localhost:9222",
+                    help="CDP URL for the already-running Edge")
     args = ap.parse_args()
 
     with sync_playwright() as p:
         browser = p.chromium.connect_over_cdp(args.cdp)
-        context = browser.contexts[0]  # Keep browser alive between runs
+        if not browser.contexts:
+            raise RuntimeError("No contexts found. Start Edge with --remote-debugging-port.")
+        context = browser.contexts[0]  # keep alive between runs (Option A)
 
         page = get_current_order_page(context)
         if not page:
-            raise RuntimeError("No open order detail tab found.")
+            raise RuntimeError("No open order detail tab found (SendungBearbeitung). Open the order first.")
 
         log(f"Using current tab: {page.url}")
         ensure_detail_ready(page)
 
-        # Get DN number
-        dn_number = page.locator("input[name='SendungNrDfue']").input_value()
-
+        dn_number = get_sendung_number(page) or "document"
         fwd = detect_forwarder(page)
         log(f"Forwarder: {fwd}")
 
-        def run_doc(value, copies=1, fedex_mode=False):
+        def run_doc(value: str, copies: int, fedex_mode: bool = False):
             select_document(page, value)
             click_leg_print_button(page)
             popupA = wait_for_first_popup(context, page)
             if not click_do_print_in_popupA(popupA):
+                log("Failed to trigger doPrint() in Popup A; skipping.")
                 return
             label_page = wait_for_label_view_after_do_print(context, popupA)
-
-            with popupA.expect_download(timeout=8000) as dl_info:
-                click_do_print_in_popupA(popupA)
-            dl = dl_info.value
-            tmp_dir = os.path.join(os.getcwd(), "_alpega_tmp")
-            os.makedirs(tmp_dir, exist_ok=True)
-            path = os.path.join(tmp_dir, f"{dn_number}.pdf")
-            dl.save_as(path)
-            with open(path, "rb") as f:
-                pdf_data = f.read()
-
             if fedex_mode:
-                fedex_print_with_ranges(pdf_data, dn_number)
+                fedex_print_with_ranges(context, label_page, popupA, dn_number)
             else:
-                silent_print(path, copies)
+                # generic: download via doPrint and print silently (single-sided)
+                pdf_bytes = fedex_try_download_via_doPrint(popupA)
+                if pdf_bytes:
+                    out_dir = os.path.join(os.getcwd(), "_alpega_tmp")
+                    os.makedirs(out_dir, exist_ok=True)
+                    out_path = os.path.join(out_dir, f"{dn_number}.pdf")
+                    save_pdf_bytes_as(out_path, pdf_bytes)
+                    silent_print(out_path, copies)
+                else:
+                    log("Could not obtain PDF for generic print; skipping.")
 
         if fwd == "FEDEX":
-            run_doc("LABELXXQQXXlabelFedExWeb", fedex_mode=True)
+            run_doc("LABELXXQQXXlabelFedExWeb", copies=1, fedex_mode=True)
+
         elif fwd == "DSV-AIR":
             run_doc("LABELXXQQXXLabelCarrier", copies=1)
+            if priority_is_S4():
+                run_doc("LOADINGLSTXXQQXXLoadinglist_empties", copies=2)
+
         elif fwd == "DSV-ROAD":
             run_doc("LABELXXQQXXLabelCarrier", copies=1)
+            run_doc("LOADINGLSTXXQQXXLoadinglist_empties", copies=1)
+            if is_outside_netherlands():
+                run_doc("LOADINGLSTXXQQXXLoadinglist_CMR_Def_Consol", copies=1)
+
         elif fwd == "DGF":
             run_doc("LABELXXQQXXLabelCarrier", copies=1)
+
         elif fwd == "DHL-EXP":
             run_doc("LABELXXQQXXLabelDHL_Web", copies=1)
+
         elif fwd == "KNN":
             run_doc("LABELXXQQXXLabelCarrier", copies=1)
+
         elif fwd == "MAERSK":
             run_doc("LABELXXQQXXLabelCarrier", copies=1)
+
         elif fwd == "TROMP":
             run_doc("LABELXXQQXXLabelCarrier", copies=1)
+            run_doc("LOADINGLSTXXQQXXLoadinglist_empties", copies=1)
+            if is_outside_netherlands():
+                run_doc("LOADINGLSTXXQQXXLoadinglist_CMR_Def_Consol", copies=1)
+
         elif fwd == "VDB":
             run_doc("LABELXXQQXXLabelCarrier", copies=1)
+            run_doc("LOADINGLSTXXQQXXLoadinglist_empties", copies=1)
+            if is_outside_netherlands():
+                run_doc("LOADINGLSTXXQQXXLoadinglist_CMR_Def_Consol", copies=1)
+
         else:
             log("Unknown forwarder. No documents printed.")
 
