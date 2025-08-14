@@ -1,16 +1,4 @@
 # file: alpega_phase2_print_attach_edge.py
-# usage:
-#   Open the order detail tab in Edge (SendungBearbeitung) -> run:
-#     python alpega_phase2_print_attach_edge.py
-#
-# Notes:
-# - Attaches to your running Edge (started with --remote-debugging-port=9222 and --kiosk-printing).
-# - No Save clicks.
-# - Forwarder-specific document selection + print logic.
-# - FedEx: pages 1–2 x2, pages 5..end x1 (skips 3–4) via PDF split & silent print.
-# - DSV AIR: Carrier Label x1; Dock Loading List x2 if PRIORITY=S4 (placeholder).
-# - DSV ROAD: Carrier Label x1; Dock Loading List x1; CMR Consol x1 if OUTSIDE_NL (placeholder).
-# - TROMP/VDB mirror DSV ROAD; DGF/KNN/MAERSK: Carrier Label x1; DHL Express: DHL Web Label x1.
 
 import argparse
 import base64
@@ -55,18 +43,16 @@ def detect_forwarder(page) -> str:
         rows.first.wait_for(state="visible", timeout=20000)
         text = "\n".join(rows.all_text_contents()).lower()
 
-    # normalize
     t = text
     if "fedex" in t: return "FEDEX"
-    if "dhl express" in t or "dhl express" in t: return "DHL-EXP"
-    if "dhl" in t and "express" not in t: return "DGF"  # conservative (you can refine)
     if "dsv" in t and "air" in t: return "DSV-AIR"
     if "dsv" in t and "road" in t: return "DSV-ROAD"
-    if "kuehne" in t or "kühne" in t or "kn" in t or "k+N" in t or "k-n" in t or "kuehne+nagel" in t or "kuehne nagel" in t or "knn" in t: return "KNN"
+    if "dhl express" in t: return "DHL-EXP"
     if "maersk" in t: return "MAERSK"
     if "tromp" in t: return "TROMP"
-    if "boogard" in t or "v.d. boogaard" in t or "vdb" in t or "boogaard" in t: return "VDB"
-
+    if "boogard" in t or "boogaard" in t or "vdb" in t: return "VDB"
+    if "kuehne" in t or "kühne" in t or "kuehne nagel" in t or "kuehne+nagel" in t or "knn" in t: return "KNN"
+    if "dhl" in t: return "DGF"  # fallback “DGF” for generic DHL (non-Express)
     return "UNKNOWN"
 
 # ---------- Doc selection + correct leg print button ----------
@@ -178,14 +164,14 @@ def wait_for_label_view_after_do_print(context, popupA):
     log("Assuming label loaded in Popup A (no new popup detected).")
     return popupA
 
-# ---------- Generic print (kiosk: always silent) ----------
+# ---------- Generic kiosk print (all pages) ----------
 
 def print_all_copies(label_page, copies: int):
     for i in range(copies):
         try:
             label_page.evaluate("() => window.print && window.print()")
         except Exception:
-            # try printing inside iframes
+            # try iframes too
             for f in label_page.frames:
                 if f == label_page.main_frame: continue
                 try:
@@ -196,23 +182,19 @@ def print_all_copies(label_page, copies: int):
         time.sleep(0.7)
     log(f"Requested {copies} copy/copies (all pages).")
 
-# ---------- FedEx special: fetch PDF → split → print subsets ----------
+# ---------- FedEx special: obtain PDF (via Download), split & print ----------
 
-def try_fetch_pdf_bytes(label_page) -> Optional[bytes]:
-    """
-    Try to fetch the PDF content of the current label page from within the browser context.
-    Works if the label URL is same-origin or CORS-permitted. Returns bytes or None.
-    """
+def try_fetch_pdf_bytes_direct(label_page) -> Optional[bytes]:
+    """First attempt: direct fetch of the label URL (CORS may block)."""
     try:
         url = label_page.url
         if not url: return None
-        # Fetch within the page to inherit cookies; return as base64
         b64 = label_page.evaluate(
             """async (u) => {
                 try {
-                    const resp = await fetch(u, {credentials:'include'});
-                    if (!resp.ok) return null;
-                    const buf = await resp.arrayBuffer();
+                    const r = await fetch(u, {credentials:'include'});
+                    if (!r.ok) return null;
+                    const buf = await r.arrayBuffer();
                     const arr = new Uint8Array(buf);
                     let bin = '';
                     for (let i=0; i<arr.length; i++) bin += String.fromCharCode(arr[i]);
@@ -226,79 +208,136 @@ def try_fetch_pdf_bytes(label_page) -> Optional[bytes]:
     except Exception:
         return None
 
-def split_pdf_ranges(pdf_bytes: bytes, ranges: List[List[int]]) -> List[bytes]:
+def try_click_download_and_get_pdf_bytes(label_page) -> Optional[bytes]:
     """
-    ranges: list of [start, end] 1-based inclusive page numbers.
-    Returns list of PDF byte blobs matching each range (skips if out of bounds).
+    Click a Download control in the label viewer and capture the file.
+    Works for Edge/Chromium PDF viewer and many custom toolbars.
     """
-    out_blobs = []
+    download_selectors = [
+        # Chromium/Edge PDF viewer (cr-icon-button)
+        "cr-icon-button[aria-label='Download']",
+        "cr-icon-button[title='Download']",
+        "cr-icon-button[aria-label*='Download']",
+        # Generic buttons/anchors
+        "button[title='Download']",
+        "button[aria-label='Download']",
+        "a[title='Download']",
+        "a[aria-label='Download']",
+        "a:has-text('Download')",
+        # Custom apps often use onclick containing 'download'
+        "a[onclick*='download']",
+        "button[onclick*='download']",
+        # Alpega-style span icon with title
+        "span[title='Download']",
+    ]
+
+    # Arm download listener, then click the first matching control
+    try:
+        with label_page.expect_download(timeout=8000) as dl_info:
+            clicked = False
+            for sel in download_selectors:
+                loc = label_page.locator(sel)
+                try:
+                    if loc.count():
+                        loc.first.scroll_into_view_if_needed()
+                        try:
+                            # some viewers need a tiny delay before click
+                            label_page.wait_for_timeout(150)
+                            loc.first.click()
+                            log(f"Clicked download via selector: {sel}")
+                            clicked = True
+                            break
+                        except Exception:
+                            # try JS click on the element
+                            try:
+                                label_page.evaluate("(el)=>el.click && el.click()", loc.first.element_handle())
+                                log(f"JS-clicked download via selector: {sel}")
+                                clicked = True
+                                break
+                            except Exception:
+                                pass
+                except Exception:
+                    continue
+
+            if not clicked:
+                log("No visible Download control found in label viewer.")
+                return None
+
+        download = dl_info.value
+        # Save to temp and read bytes
+        tmp_dir = os.path.join(os.getcwd(), "_alpega_tmp")
+        os.makedirs(tmp_dir, exist_ok=True)
+        path = os.path.join(tmp_dir, download.suggested_filename or "label.pdf")
+        download.save_as(path)
+        with open(path, "rb") as f:
+            data = f.read()
+        log(f"Downloaded label file: {os.path.basename(path)} ({len(data)} bytes).")
+        return data
+    except Exception as e:
+        log(f"Download attempt failed: {e}")
+        return None
+
+def split_pdf_ranges(pdf_bytes: bytes, ranges: List[List[int]]) -> List[Optional[bytes]]:
+    outs = []
     reader = PdfReader(io.BytesIO(pdf_bytes))
     total = len(reader.pages)
     for start, end in ranges:
         s = max(1, start); e = min(total, end)
-        if s > e: 
-            out_blobs.append(None)
-            continue
+        if s > e:
+            outs.append(None); continue
         writer = PdfWriter()
         for p in range(s-1, e):
             writer.add_page(reader.pages[p])
         bio = io.BytesIO()
         writer.write(bio)
-        out_blobs.append(bio.getvalue())
-    return out_blobs
+        outs.append(bio.getvalue())
+    return outs
 
 def open_data_pdf_and_print(context, name: str, pdf_bytes: bytes, copies: int):
-    """
-    Save the PDF to a temp file, open file:// in a new tab, and silent-print (kiosk).
-    """
     tmp_dir = os.path.join(os.getcwd(), "_alpega_tmp")
     os.makedirs(tmp_dir, exist_ok=True)
     path = os.path.join(tmp_dir, f"{name}.pdf")
     with open(path, "wb") as f:
         f.write(pdf_bytes)
-
     page = context.new_page()
     page.goto("file:///" + path.replace("\\", "/"), wait_until="load")
     print_all_copies(page, copies)
-    # keep tab open briefly to avoid race with print pipeline
     time.sleep(1.2)
-    try:
-        page.close()
-    except:
-        pass
+    try: page.close()
+    except: pass
 
 def fedex_print_with_ranges(context, label_page):
     """
-    FedEx rule:
+    FedEx:
       - print pages 1–2 twice
       - print pages 5..end once (skip 3–4)
     """
-    log("FedEx: trying to fetch and split PDF for page-range printing.")
-    pdf_bytes = try_fetch_pdf_bytes(label_page)
+    log("FedEx: attempting to obtain PDF for page-range printing.")
+    pdf_bytes = try_fetch_pdf_bytes_direct(label_page)
     if not pdf_bytes:
-        log("FedEx: could not fetch PDF bytes (viewer/CORS blocked). NOT printing to avoid wrong pages.")
-        log("Hint: if there is a download button in Popup A/label viewer, we can click it and use that file.")
+        log("FedEx: direct fetch blocked; trying Download button...")
+        pdf_bytes = try_click_download_and_get_pdf_bytes(label_page)
+
+    if not pdf_bytes:
+        log("FedEx: could not obtain PDF (no fetch & no download). Skipping prints to avoid wrong pages.")
         return
 
-    # Build blobs for 1–2 and 5..end
-    # First we need total page count
     reader = PdfReader(io.BytesIO(pdf_bytes))
     total = len(reader.pages)
-
-    # (1) pages 1–2
+    # 1–2 (x2)
     part12 = split_pdf_ranges(pdf_bytes, [[1, min(2, total)]])[0]
     if part12:
         open_data_pdf_and_print(context, "fedex_pages_1_2", part12, copies=2)
     else:
-        log("FedEx: document has <1 page? skipping 1–2 set.")
+        log("FedEx: document has <1 page? Skipping 1–2 set.")
 
-    # (2) pages 5..end (if any)
+    # 5..end (x1)
     if total >= 5:
-        part5_end = split_pdf_ranges(pdf_bytes, [[5, total]])[0]
-        if part5_end:
-            open_data_pdf_and_print(context, "fedex_pages_5_end", part5_end, copies=1)
+        part5n = split_pdf_ranges(pdf_bytes, [[5, total]])[0]
+        if part5n:
+            open_data_pdf_and_print(context, "fedex_pages_5_end", part5n, copies=1)
     else:
-        log("FedEx: document has fewer than 5 pages; skipping 5..end set.")
+        log("FedEx: document has <5 pages; skipping 5..end set.")
 
 # ---------- Placeholder flags (to integrate later) ----------
 
@@ -315,7 +354,7 @@ def is_outside_netherlands() -> bool:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cdp", default="http://localhost:9222",
-                    help="CDP URL for the already-running Edge (started with --remote-debugging-port)")
+                    help="CDP URL for the already-running Edge (started with --remote-debugging-port + --kiosk-printing)")
     args = ap.parse_args()
 
     with sync_playwright() as p:
@@ -334,7 +373,6 @@ def main():
         fwd = detect_forwarder(page)
         log(f"Forwarder: {fwd}")
 
-        # Routing: select doc(s), open popup, click Print inside, then print per rules
         def run_doc(value: str, copies: int, fedex_mode: bool = False):
             select_document(page, value)
             click_leg_print_button(page)
@@ -353,44 +391,39 @@ def main():
             run_doc("LABELXXQQXXlabelFedExWeb", copies=1, fedex_mode=True)
 
         elif fwd == "DSV-AIR":
-            # Once all pages: Carrier Label
-            run_doc("LABELXXQQXXLabelCarrier", copies=1, fedex_mode=False)
-            # Twice all pages if priority is S4 (placeholder)
+            run_doc("LABELXXQQXXLabelCarrier", copies=1)
             if priority_is_S4():
-                run_doc("LOADINGLSTXXQQXXLoadinglist_empties", copies=2, fedex_mode=False)
+                run_doc("LOADINGLSTXXQQXXLoadinglist_empties", copies=2)
 
         elif fwd == "DSV-ROAD":
-            # Carrier Label x1
-            run_doc("LABELXXQQXXLabelCarrier", copies=1, fedex_mode=False)
-            # Dock Loading List x1
-            run_doc("LOADINGLSTXXQQXXLoadinglist_empties", copies=1, fedex_mode=False)
-            # CMR Consol x1 if outside NL (placeholder)
+            run_doc("LABELXXQQXXLabelCarrier", copies=1)
+            run_doc("LOADINGLSTXXQQXXLoadinglist_empties", copies=1)
             if is_outside_netherlands():
-                run_doc("LOADINGLSTXXQQXXLoadinglist_CMR_Def_Consol", copies=1, fedex_mode=False)
+                run_doc("LOADINGLSTXXQQXXLoadinglist_CMR_Def_Consol", copies=1)
 
         elif fwd == "DGF":
-            run_doc("LABELXXQQXXLabelCarrier", copies=1, fedex_mode=False)
+            run_doc("LABELXXQQXXLabelCarrier", copies=1)
 
         elif fwd == "DHL-EXP":
-            run_doc("LABELXXQQXXLabelDHL_Web", copies=1, fedex_mode=False)
+            run_doc("LABELXXQQXXLabelDHL_Web", copies=1)
 
         elif fwd == "KNN":
-            run_doc("LABELXXQQXXLabelCarrier", copies=1, fedex_mode=False)
+            run_doc("LABELXXQQXXLabelCarrier", copies=1)
 
         elif fwd == "MAERSK":
-            run_doc("LABELXXQQXXLabelCarrier", copies=1, fedex_mode=False)
+            run_doc("LABELXXQQXXLabelCarrier", copies=1)
 
         elif fwd == "TROMP":
-            run_doc("LABELXXQQXXLabelCarrier", copies=1, fedex_mode=False)
-            run_doc("LOADINGLSTXXQQXXLoadinglist_empties", copies=1, fedex_mode=False)
+            run_doc("LABELXXQQXXLabelCarrier", copies=1)
+            run_doc("LOADINGLSTXXQQXXLoadinglist_empties", copies=1)
             if is_outside_netherlands():
-                run_doc("LOADINGLSTXXQQXXLoadinglist_CMR_Def_Consol", copies=1, fedex_mode=False)
+                run_doc("LOADINGLSTXXQQXXLoadinglist_CMR_Def_Consol", copies=1)
 
         elif fwd == "VDB":
-            run_doc("LABELXXQQXXLabelCarrier", copies=1, fedex_mode=False)
-            run_doc("LOADINGLSTXXQQXXLoadinglist_empties", copies=1, fedex_mode=False)
+            run_doc("LABELXXQQXXLabelCarrier", copies=1)
+            run_doc("LOADINGLSTXXQQXXLoadinglist_empties", copies=1)
             if is_outside_netherlands():
-                run_doc("LOADINGLSTXXQQXXLoadinglist_CMR_Def_Consol", copies=1, fedex_mode=False)
+                run_doc("LOADINGLSTXXQQXXLoadinglist_CMR_Def_Consol", copies=1)
 
         else:
             log("Unknown forwarder. No documents printed.")
