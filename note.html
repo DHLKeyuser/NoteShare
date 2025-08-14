@@ -20,10 +20,9 @@ def log(m): print(f"[phase2] {m}", flush=True)
 
 def connect_over_cdp_with_retry(pw, cdp_url: str, attempts: int = 3, pause_s: float = 0.6):
     last_err = None
-    for i in range(1, attempts + 1):
+    for _ in range(attempts):
         try:
-            b = pw.chromium.connect_over_cdp(cdp_url)
-            return b
+            return pw.chromium.connect_over_cdp(cdp_url)
         except Exception as e:
             last_err = e
             time.sleep(pause_s)
@@ -143,24 +142,29 @@ def trigger_do_print(popupA):
             return
     except Exception:
         pass
-    log("Warning: could not trigger doPrint() (continuing with network sniff).")
+    log("Warning: could not trigger doPrint() (will try other capture paths).")
 
-# -------------------- PDF capture (unified, download + network sniff + request) --------------------
+# -------------------- PDF capture (download + network sniff + request) --------------------
+
+def _remove_ctx_listener(context, event: str, handler):
+    try:
+        # Playwright Python uses remove_listener, not off
+        context.remove_listener(event, handler)
+    except Exception:
+        pass
 
 def capture_pdf_bytes_after_doprint(context, popupA, timeout_ms=12000) -> Optional[bytes]:
     """
-    Robustly obtain the PDF bytes after doPrint():
-    1) Try popupA.expect_download
-    2) Try context.expect_event('download')
-    3) Sniff any 'application/pdf' response body on the context
-    4) If a label page appears with URL that ends with .pdf or contains 'DispoPrint',
-       request it via context.request (cookie-aware)
+    Obtain the PDF bytes after doPrint():
+    1) popupA.expect_download
+    2) context.expect_event('download')
+    3) sniff 'application/pdf' responses at context level
+    4) try requesting a visible PDF/DispoPrint URL via context.request
     """
     pdf_bytes = {"data": None}
 
-    # 3) Response sniffer
     def _on_response(resp):
-        if pdf_bytes["data"]:  # already got one
+        if pdf_bytes["data"]:
             return
         try:
             ctype = (resp.headers.get("content-type") or "").lower()
@@ -168,7 +172,7 @@ def capture_pdf_bytes_after_doprint(context, popupA, timeout_ms=12000) -> Option
             if ("application/pdf" in ctype) or url.endswith(".pdf") or ("dispoprint" in url):
                 try:
                     body = resp.body()
-                    if body and len(body) > 0:
+                    if body:
                         pdf_bytes["data"] = body
                 except Exception:
                     pass
@@ -177,26 +181,25 @@ def capture_pdf_bytes_after_doprint(context, popupA, timeout_ms=12000) -> Option
 
     context.on("response", _on_response)
 
-    # Fire doPrint (once)
+    # Fire doPrint once
     trigger_do_print(popupA)
 
-    # 1) Popup-level download
+    # 1) popup-level download
     try:
         with popupA.expect_download(timeout=timeout_ms//2) as dl_info:
-            # doPrint already fired; nothing to do here
-            pass
+            pass  # already fired
         dl = dl_info.value
         tmp = os.path.join(os.getcwd(), OUT_DIR); os.makedirs(tmp, exist_ok=True)
         temp_path = os.path.join(tmp, dl.suggested_filename or "label.pdf")
         dl.save_as(temp_path)
         with open(temp_path, "rb") as f:
             data = f.read()
-        context.off("response", _on_response)
+        _remove_ctx_listener(context, "response", _on_response)
         return data
     except Exception:
         pass
 
-    # 2) Context-level download
+    # 2) context-level download
     try:
         with context.expect_event("download", timeout=timeout_ms//2) as ev_info:
             pass
@@ -206,33 +209,31 @@ def capture_pdf_bytes_after_doprint(context, popupA, timeout_ms=12000) -> Option
         dl.save_as(temp_path)
         with open(temp_path, "rb") as f:
             data = f.read()
-        context.off("response", _on_response)
+        _remove_ctx_listener(context, "response", _on_response)
         return data
     except Exception:
         pass
 
-    # Wait briefly if sniffer caught it
+    # 3) wait a bit for the response sniffer
     t0 = time.time()
     while (time.time() - t0) < (timeout_ms / 1000.0):
         if pdf_bytes["data"]:
-            context.off("response", _on_response)
+            _remove_ctx_listener(context, "response", _on_response)
             return pdf_bytes["data"]
         time.sleep(0.08)
 
-    # 4) As a last resort, try to find a label/iframe URL and fetch via context.request
-    context.off("response", _on_response)
+    _remove_ctx_listener(context, "response", _on_response)
+
+    # 4) last resort: try fetching visible PDF-like URL via context.request
     try:
-        # Try the popup URL itself
         url = (popupA.url or "")
         if url and (url.lower().endswith(".pdf") or "dispoprint" in url.lower()):
-            resp = context.request.get(url, headers={"Accept":"application/pdf,*/*"})
+            resp = context.request.get(url, headers={"Accept": "application/pdf,*/*"})
             if resp.ok and "application/pdf" in (resp.headers.get("content-type","").lower()):
                 return resp.body()
 
-        # Try to look inside frames for <embed>/<iframe> src
         for fr in [popupA.main_frame, *popupA.frames]:
             try:
-                # any element with src ending .pdf
                 el = fr.locator("embed[src$='.pdf'], iframe[src$='.pdf'], object[data$='.pdf']").first
                 if el.count():
                     src = el.get_attribute("src")
@@ -298,7 +299,7 @@ def split_pdf_ranges(pdf_bytes: bytes, ranges: List[List[int]]) -> List[Optional
         outs.append(bio.getvalue())
     return outs
 
-# -------------------- Per-doc runner --------------------
+# -------------------- Per-doc runner (ALL Sumatra) --------------------
 
 def run_doc_sumatra(context, page, value: str, dn: str, doc_suffix: str, copies: int, fedex_special: bool=False):
     select_document(page, value)
@@ -417,7 +418,7 @@ def main():
         else:
             log("Unknown forwarder. No documents printed.")
 
-        log("Done. (Edge session left open; no tabs closed, no context/browser close)")
+        log("Done. (No tabs/contexts/browsers closed)")
 
 if __name__ == "__main__":
     main()
