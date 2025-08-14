@@ -1,4 +1,17 @@
 # file: alpega_phase2_print_attach_edge.py
+# usage:
+#   1) Start Edge:
+#      "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" ^
+#        --remote-debugging-port=9222 ^
+#        --kiosk-printing ^
+#        --user-data-dir="C:\Users\<YOUR_USERNAME>\AppData\Local\Microsoft\Edge\User Data"
+#   2) Open the order detail page (SendungBearbeitung) in that Edge.
+#   3) Run:
+#        python alpega_phase2_print_attach_edge.py
+#
+# Requirements:
+#   pip install playwright PyPDF2
+#   playwright install  (if not done before)
 
 import argparse
 import base64
@@ -19,7 +32,8 @@ def log(m): print(f"[phase2] {m}", flush=True)
 def get_current_order_page(context) -> Optional[object]:
     for p in context.pages:
         try:
-            if p.is_closed(): continue
+            if p.is_closed():
+                continue
             if DETAIL_PATH_KEY in (p.url or ""):
                 return p
         except Exception:
@@ -52,7 +66,7 @@ def detect_forwarder(page) -> str:
     if "tromp" in t: return "TROMP"
     if "boogard" in t or "boogaard" in t or "vdb" in t: return "VDB"
     if "kuehne" in t or "kühne" in t or "kuehne nagel" in t or "kuehne+nagel" in t or "knn" in t: return "KNN"
-    if "dhl" in t: return "DGF"  # fallback “DGF” for generic DHL (non-Express)
+    if "dhl" in t: return "DGF"  # conservative fallback for non-Express DHL/DGF
     return "UNKNOWN"
 
 # ---------- Doc selection + correct leg print button ----------
@@ -64,17 +78,22 @@ def select_document(page, value: str):
     log(f"Selected document value={value}")
 
 def click_leg_print_button(page):
+    # click the Leg Print button in the same cell/row as the select
     sel = page.locator("#elmtLeg\\.DokumenteDokumente")
     sel.wait_for(state="visible", timeout=15000)
     container = sel.locator("xpath=ancestor::td[1]")
+
     btn = container.locator("#aElmtBtnLegPrint")
     if not btn.count():
         btn = container.locator("#elmtBtnLegPrint")
+
     if btn.count():
         btn.first.scroll_into_view_if_needed()
         btn.first.click()
         log("Clicked Leg Print button within document area.")
         return
+
+    # fallback: app JS
     page.evaluate("() => (typeof clickGuiButton==='function') && clickGuiButton('BtnLegPrint')")
     log("Fallback: invoked clickGuiButton('BtnLegPrint').")
 
@@ -113,7 +132,7 @@ def click_do_print_in_popupA(popup):
                     return True
                 except Exception:
                     return True
-            # fallback anchor
+            # fallback to anchor
             try:
                 loc = popup.locator("a[onclick*='doPrint'], a.locale-icon-print, span[title='Print']").first
                 try:
@@ -167,28 +186,34 @@ def wait_for_label_view_after_do_print(context, popupA):
 # ---------- Generic kiosk print (all pages) ----------
 
 def print_all_copies(label_page, copies: int):
-    for i in range(copies):
+    for _ in range(copies):
         try:
             label_page.evaluate("() => window.print && window.print()")
         except Exception:
-            # try iframes too
+            # try any sub-frames too
+            printed = False
             for f in label_page.frames:
-                if f == label_page.main_frame: continue
+                if f == label_page.main_frame:
+                    continue
                 try:
                     f.evaluate("() => window.print && window.print()")
+                    printed = True
                     break
                 except:
                     continue
+            if not printed:
+                log("Warning: window.print() failed on label page.")
         time.sleep(0.7)
     log(f"Requested {copies} copy/copies (all pages).")
 
-# ---------- FedEx special: obtain PDF (via Download), split & print ----------
+# ---------- FedEx special: obtain PDF & split ----------
 
 def try_fetch_pdf_bytes_direct(label_page) -> Optional[bytes]:
-    """First attempt: direct fetch of the label URL (CORS may block)."""
+    """Direct fetch of current URL (may be CORS-blocked by viewer)."""
     try:
         url = label_page.url
-        if not url: return None
+        if not url:
+            return None
         b64 = label_page.evaluate(
             """async (u) => {
                 try {
@@ -203,35 +228,25 @@ def try_fetch_pdf_bytes_direct(label_page) -> Optional[bytes]:
             }""",
             url
         )
-        if not b64: return None
+        if not b64:
+            return None
         return base64.b64decode(b64)
     except Exception:
         return None
 
 def try_click_download_and_get_pdf_bytes(label_page) -> Optional[bytes]:
-    """
-    Click a Download control in the label viewer and capture the file.
-    Works for Edge/Chromium PDF viewer and many custom toolbars.
-    """
+    """Best-effort for environments with a real browser download; your viewer uses native Save, so this usually won't fire."""
     download_selectors = [
-        # Chromium/Edge PDF viewer (cr-icon-button)
         "cr-icon-button[aria-label='Download']",
         "cr-icon-button[title='Download']",
-        "cr-icon-button[aria-label*='Download']",
-        # Generic buttons/anchors
         "button[title='Download']",
-        "button[aria-label='Download']",
         "a[title='Download']",
-        "a[aria-label='Download']",
+        "span[title='Download']",
         "a:has-text('Download')",
-        # Custom apps often use onclick containing 'download'
         "a[onclick*='download']",
         "button[onclick*='download']",
-        # Alpega-style span icon with title
-        "span[title='Download']",
+        "button#save",   # your viewer's "Save (Ctrl+S)" – note: opens OS dialog, so expect_download won't fire
     ]
-
-    # Arm download listener, then click the first matching control
     try:
         with label_page.expect_download(timeout=8000) as dl_info:
             clicked = False
@@ -240,31 +255,23 @@ def try_click_download_and_get_pdf_bytes(label_page) -> Optional[bytes]:
                 try:
                     if loc.count():
                         loc.first.scroll_into_view_if_needed()
+                        label_page.wait_for_timeout(150)
                         try:
-                            # some viewers need a tiny delay before click
-                            label_page.wait_for_timeout(150)
                             loc.first.click()
-                            log(f"Clicked download via selector: {sel}")
-                            clicked = True
-                            break
                         except Exception:
-                            # try JS click on the element
                             try:
                                 label_page.evaluate("(el)=>el.click && el.click()", loc.first.element_handle())
-                                log(f"JS-clicked download via selector: {sel}")
-                                clicked = True
-                                break
                             except Exception:
-                                pass
+                                continue
+                        log(f"Clicked download via selector: {sel}")
+                        clicked = True
+                        break
                 except Exception:
                     continue
-
             if not clicked:
                 log("No visible Download control found in label viewer.")
                 return None
-
         download = dl_info.value
-        # Save to temp and read bytes
         tmp_dir = os.path.join(os.getcwd(), "_alpega_tmp")
         os.makedirs(tmp_dir, exist_ok=True)
         path = os.path.join(tmp_dir, download.suggested_filename or "label.pdf")
@@ -277,6 +284,39 @@ def try_click_download_and_get_pdf_bytes(label_page) -> Optional[bytes]:
         log(f"Download attempt failed: {e}")
         return None
 
+def try_capture_pdf_via_reload(label_page, context, timeout_ms=12000) -> Optional[bytes]:
+    """
+    Reload the label page and capture the PDF bytes from the network response
+    (works even when fetch is blocked and Save is a native dialog).
+    """
+    pdf_blob = {"data": None}
+    def _on_response(resp):
+        try:
+            ctype = (resp.headers.get("content-type") or "").lower()
+            url = (resp.url or "").lower()
+            if "application/pdf" in ctype or url.endswith(".pdf") or "dispoprint" in url:
+                if resp.request.frame == label_page.main_frame:
+                    body = resp.body()
+                    if body and len(body) > 0:
+                        pdf_blob["data"] = body
+        except Exception:
+            pass
+
+    label_page.on("response", _on_response)
+    try:
+        label_page.reload(wait_until="load", timeout=timeout_ms)
+    except Exception:
+        pass
+
+    t0 = time.time()
+    while (time.time() - t0) < (timeout_ms / 1000):
+        if pdf_blob["data"]:
+            break
+        time.sleep(0.1)
+
+    label_page.off("response", _on_response)
+    return pdf_blob["data"]
+
 def split_pdf_ranges(pdf_bytes: bytes, ranges: List[List[int]]) -> List[Optional[bytes]]:
     outs = []
     reader = PdfReader(io.BytesIO(pdf_bytes))
@@ -284,7 +324,8 @@ def split_pdf_ranges(pdf_bytes: bytes, ranges: List[List[int]]) -> List[Optional
     for start, end in ranges:
         s = max(1, start); e = min(total, end)
         if s > e:
-            outs.append(None); continue
+            outs.append(None)
+            continue
         writer = PdfWriter()
         for p in range(s-1, e):
             writer.add_page(reader.pages[p])
@@ -303,8 +344,10 @@ def open_data_pdf_and_print(context, name: str, pdf_bytes: bytes, copies: int):
     page.goto("file:///" + path.replace("\\", "/"), wait_until="load")
     print_all_copies(page, copies)
     time.sleep(1.2)
-    try: page.close()
-    except: pass
+    try:
+        page.close()
+    except:
+        pass
 
 def fedex_print_with_ranges(context, label_page):
     """
@@ -312,26 +355,32 @@ def fedex_print_with_ranges(context, label_page):
       - print pages 1–2 twice
       - print pages 5..end once (skip 3–4)
     """
-    log("FedEx: attempting to obtain PDF for page-range printing.")
-    pdf_bytes = try_fetch_pdf_bytes_direct(label_page)
+    log("FedEx: obtaining PDF via network capture (reload).")
+    pdf_bytes = try_capture_pdf_via_reload(label_page, context, timeout_ms=15000)
+
     if not pdf_bytes:
-        log("FedEx: direct fetch blocked; trying Download button...")
+        log("FedEx: reload capture didn’t return PDF; trying direct fetch (may be CORS-blocked).")
+        pdf_bytes = try_fetch_pdf_bytes_direct(label_page)
+
+    if not pdf_bytes:
+        log("FedEx: no PDF from reload or fetch; trying viewer Download button…")
         pdf_bytes = try_click_download_and_get_pdf_bytes(label_page)
 
     if not pdf_bytes:
-        log("FedEx: could not obtain PDF (no fetch & no download). Skipping prints to avoid wrong pages.")
+        log("FedEx: could not obtain PDF (no capture/fetch/download). Skipping prints to avoid wrong pages.")
         return
 
     reader = PdfReader(io.BytesIO(pdf_bytes))
     total = len(reader.pages)
-    # 1–2 (x2)
+
+    # pages 1–2 (x2)
     part12 = split_pdf_ranges(pdf_bytes, [[1, min(2, total)]])[0]
     if part12:
         open_data_pdf_and_print(context, "fedex_pages_1_2", part12, copies=2)
     else:
         log("FedEx: document has <1 page? Skipping 1–2 set.")
 
-    # 5..end (x1)
+    # pages 5..end (x1)
     if total >= 5:
         part5n = split_pdf_ranges(pdf_bytes, [[5, total]])[0]
         if part5n:
@@ -387,7 +436,6 @@ def main():
                 print_all_copies(label_page, copies)
 
         if fwd == "FEDEX":
-            # FedEx Label with page-range logic
             run_doc("LABELXXQQXXlabelFedExWeb", copies=1, fedex_mode=True)
 
         elif fwd == "DSV-AIR":
