@@ -110,70 +110,90 @@ def wait_for_first_popup(context, page):
                 return new_pages[0]
         raise RuntimeError("No popup detected after clicking Leg Print.")
 
-def click_do_print_in_popupA(popup):
-    popup.bring_to_front()
-    try:
-        popup.wait_for_load_state("domcontentloaded", timeout=4000)
-    except:
-        pass
-    deadline = time.time() + 5.0
-    while time.time() < deadline:
-        try:
-            has_do_print = popup.evaluate("() => typeof doPrint === 'function'")
-            if has_do_print:
-                try:
-                    popup.evaluate("() => doPrint()")
-                    log("Called doPrint() in Popup A via JS.")
-                    return True
-                except Exception:
-                    return True
-            # fallback toolbar element
-            try:
-                loc = popup.locator("a[onclick*='doPrint'], a.locale-icon-print, span[title='Print']").first
-                if loc.count():
-                    loc.click()
-                    log("Clicked toolbar Print in Popup A.")
-                    return True
-            except Exception:
-                pass
-        except Exception:
-            pass
-        time.sleep(0.15)
-    log("Could not trigger doPrint() in Popup A within timeout.")
-    return False
+from playwright.sync_api import TimeoutError as PWTimeout
 
-def wait_for_label_view_after_do_print(context, popupA):
-    try:
-        popupB = popupA.wait_for_event("popup", timeout=4000)
-        log("Popup B (label) opened via event.")
-        try: popupB.wait_for_load_state("load", timeout=6000)
-        except: pass
-        return popupB
-    except Exception:
-        pass
+def click_do_print_and_get_download(context, popupA, timeout_ms=12000):
+   """
+   Robustly trigger the label print from Popup A and capture the resulting Download.
+   Some environments emit the Download from Popup A; others emit it on the BrowserContext.
+   We try both, without leaving dangling listeners.
+   Returns: playwright Download object or None.
+   """
+   popupA.bring_to_front()
+   try:
+       popupA.wait_for_load_state("domcontentloaded", timeout=4000)
+   except Exception:
+       pass
 
-    before = set(context.pages)
-    for _ in range(20):
-        time.sleep(0.15)
-        after = set(context.pages)
-        new_pages = list(after - before)
-        if new_pages:
-            popupB = new_pages[0]
-            log("Popup B (label) detected as a new tab.")
-            try: popupB.wait_for_load_state("load", timeout=6000)
-            except: pass
-            return popupB
+   # Helper to trigger doPrint (with a toolbar fallback)
+   def _fire_print():
+       try:
+           if popupA.evaluate("() => typeof doPrint === 'function'"):
+               popupA.evaluate("() => doPrint()")
+               return True
+       except Exception:
+           pass
+       try:
+           # fallback toolbar element
+           loc = popupA.locator("a[onclick*='doPrint'], a.locale-icon-print, span[title='Print']").first
+           if loc.count():
+               loc.click()
+               return True
+       except Exception:
+           pass
+       return False
 
-    try:
-        url = (popupA.url or "").lower()
-    except:
-        url = ""
-    if "pdf" in url or url.endswith(".pdf"):
-        log("Label appears to be loaded in Popup A (PDF URL).")
-        return popupA
+   # 1) Try capturing download directly from Popup A
+   try:
+       with popupA.expect_download(timeout=timeout_ms) as dl_info:
+           _ = _fire_print()  # trigger print (ignore boolean result)
+       return dl_info.value
+   except PWTimeout:
+       pass  # fall through and try context-level
+   except Exception:
+       pass
 
-    log("Assuming label loaded in Popup A (no new popup detected).")
-    return popupA
+   # 2) Some sites attach the download to the *context* rather than the popup
+   try:
+       with context.expect_event("download", timeout=timeout_ms) as ev_info:
+           _ = _fire_print()  # trigger again in case previous didn’t fire
+       return ev_info.value
+   except PWTimeout:
+       return None
+   except Exception:
+       return None
+
+
+def wait_for_label_view_after_do_print(context, popupA, timeout_ms=5000):
+   """
+   Keep this for completeness if you still need a handle to the label tab,
+   but most flows can skip it once we capture the Download.
+   """
+   try:
+       popupB = popupA.wait_for_event("popup", timeout=timeout_ms)
+       try:
+           popupB.wait_for_load_state("load", timeout=timeout_ms)
+       except Exception:
+           pass
+       return popupB
+   except Exception:
+       pass
+
+   before = set(context.pages)
+   for _ in range(int(timeout_ms / 150)):
+       time.sleep(0.15)
+       after = set(context.pages)
+       new_pages = list(after - before)
+       if new_pages:
+           popupB = new_pages[0]
+           try:
+               popupB.wait_for_load_state("load", timeout=timeout_ms)
+           except Exception:
+               pass
+           return popupB
+
+   # If nothing popped, just return Popup A (some viewers render inline)
+   return popupA
 
 # ---------- Browser print (kept, though we now use Sumatra) ----------
 
@@ -259,30 +279,11 @@ def try_click_download_and_get_pdf_bytes(label_page) -> Optional[bytes]:
         "button#save",
     ]
     try:
-        with label_page.expect_download(timeout=6000) as dl_info:
-            clicked = False
-            for sel in selectors:
-                loc = label_page.locator(sel)
-                try:
-                    if loc.count():
-                        loc.first.scroll_into_view_if_needed()
-                        label_page.wait_for_timeout(100)
-                        try:
-                            loc.first.click()
-                        except Exception:
-                            try:
-                                label_page.evaluate("(el)=>el.click && el.click()", loc.first.element_handle())
-                            except Exception:
-                                continue
-                        log(f"Clicked download via selector: {sel}")
-                        clicked = True
-                        break
-                except Exception:
-                    continue
-            if not clicked:
-                log("No visible Download control found in label viewer.")
-                return None
-        dl = dl_info.value
+# NEW
+        dl = click_do_print_and_get_download(context, popupA, timeout_ms=12000)
+        if not dl:
+            log("No download event captured after doPrint().")
+            return  # or handle fallback as you prefer
         tmp_dir = os.path.join(os.getcwd(), "_alpega_tmp")
         os.makedirs(tmp_dir, exist_ok=True)
         path = os.path.join(tmp_dir, dl.suggested_filename or "label.pdf")
@@ -504,9 +505,8 @@ def main():
     with sync_playwright() as p:
         browser = p.chromium.connect_over_cdp(args.cdp)
         if not browser.contexts:
-            raise RuntimeError("No contexts found. Start Edge with --remote-debugging-port.")
-        context = browser.contexts[0]  # keep alive between runs (Option A)
-
+            raise RuntimeError("No contexts found. Start Edge with --remote-debugging-port + --kiosk-printing.")
+        context = browser.contexts[0]
         page = get_current_order_page(context)
         if not page:
             raise RuntimeError("No open order detail tab found (SendungBearbeitung). Open the order first.")
@@ -582,6 +582,14 @@ def main():
             log("Unknown forwarder. No documents printed.")
 
         log("Done.")
+    try:
+        context.close()
+    except Exception:
+        pass
+    try:
+        browser.close()
+    except Exception:
+        pass
 
 if __name__ == "__main__":
     main()
