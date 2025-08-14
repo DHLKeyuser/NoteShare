@@ -11,22 +11,22 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 from PyPDF2 import PdfReader, PdfWriter
 
 DETAIL_PATH_KEY = "/ls/vsa/servlet/SendungBearbeitung"
-SUMATRA_PATH = r"C:\Users\tamolnar\Documents\SumatraPDF-3.5.2-64\SumatraPDF.exe"
-OUT_DIR = "_alpega_tmp"
+SUMATRA_PATH   = r"C:\Users\tamolnar\Documents\SumatraPDF-3.5.2-64\SumatraPDF.exe"
+OUT_DIR        = "_alpega_tmp"
 
 def log(m): print(f"[phase2] {m}", flush=True)
 
 # -------------------- CDP connect (robust) --------------------
 
 def connect_over_cdp_with_retry(pw, cdp_url: str, attempts: int = 3, pause_s: float = 0.6):
-    last_err = None
+    err = None
     for _ in range(attempts):
         try:
             return pw.chromium.connect_over_cdp(cdp_url)
         except Exception as e:
-            last_err = e
+            err = e
             time.sleep(pause_s)
-    raise last_err
+    raise err
 
 # -------------------- Context / page helpers --------------------
 
@@ -47,10 +47,10 @@ def get_sendung_number(page) -> Optional[str]:
     try:
         loc = page.locator("input[name='SendungNrDfue']")
         if loc.count():
-            val = loc.first.input_value().strip()
-            if val: return val
-        val2 = page.locator("div.input-disabled i").first.inner_text().strip()
-        return val2 if val2 else None
+            v = loc.first.input_value().strip()
+            if v: return v
+        v2 = page.locator("div.input-disabled i").first.inner_text().strip()
+        return v2 if v2 else None
     except Exception:
         return None
 
@@ -58,25 +58,23 @@ def get_sendung_number(page) -> Optional[str]:
 
 def detect_forwarder(page) -> str:
     legs_tbl = page.locator("#TableLegs")
-    text = ""
     if legs_tbl.count() > 0:
         legs_tbl.wait_for(state="visible", timeout=8000)
-        text = legs_tbl.inner_text().lower()
+        t = legs_tbl.inner_text().lower()
     else:
         rows = page.locator("tr.table-list-row--border")
         rows.first.wait_for(state="visible", timeout=8000)
-        text = "\n".join(rows.all_text_contents()).lower()
+        t = "\n".join(rows.all_text_contents()).lower()
 
-    t = text
     if "fedex" in t: return "FEDEX"
     if "dsv" in t and "air" in t: return "DSV-AIR"
     if "dsv" in t and "road" in t: return "DSV-ROAD"
     if "dhl express" in t: return "DHL-EXP"
     if "maersk" in t: return "MAERSK"
     if "tromp" in t: return "TROMP"
-    if any(x in t for x in ["boogard", "boogaard", "vdb"]): return "VDB"
-    if any(x in t for x in ["kuehne", "kühne", "kuehne nagel", "kuehne+nagel", "knn"]): return "KNN"
-    if "dhl" in t: return "DGF"  # generic -> DGF
+    if any(x in t for x in ["boogard","boogaard","vdb"]): return "VDB"
+    if any(x in t for x in ["kuehne","kühne","kuehne nagel","kuehne+nagel","knn"]): return "KNN"
+    if "dhl" in t: return "DGF"
     return "UNKNOWN"
 
 # -------------------- Document select + print button --------------------
@@ -102,23 +100,64 @@ def click_leg_print_button(page):
     page.evaluate("() => (typeof clickGuiButton==='function') && clickGuiButton('BtnLegPrint')")
     log("Fallback: invoked clickGuiButton('BtnLegPrint').")
 
-# -------------------- Popup helpers --------------------
+# -------------------- Popup helpers (reusing same popup if needed) --------------------
 
-def wait_for_first_popup(context, page):
+def popup_has_print_ui(popup) -> bool:
     try:
-        popup = page.wait_for_event("popup", timeout=6000)
-        log("Popup A detected.")
+        if popup.evaluate("() => typeof doPrint === 'function'"):
+            return True
+    except Exception:
+        pass
+    try:
+        loc = popup.locator("a[onclick*='doPrint'], a.locale-icon-print, span[title='Print']")
+        return loc.count() > 0
+    except Exception:
+        return False
+
+def wait_for_popup_or_reuse(context, page, existing_popup=None, total_ms=6000):
+    """
+    After clicking the Leg Print button, Alpega may:
+    - open a NEW popup (event fires),
+    - or REUSE the existing popup (no 'popup' event). This handles both.
+    """
+    start = time.time()
+
+    # First try to reuse an existing popup (common for 2nd/3rd print)
+    if existing_popup and not existing_popup.is_closed():
+        try:
+            existing_popup.bring_to_front()
+        except Exception:
+            pass
+        # wait for the print UI to become available
+        while (time.time() - start) < (total_ms/1000.0):
+            if popup_has_print_ui(existing_popup):
+                log("Reused existing popup for this document.")
+                return existing_popup
+            time.sleep(0.15)
+
+    # Otherwise, wait for a new popup event briefly
+    try:
+        left = max(0, int(total_ms - (time.time()-start)*1000))
+        popup = page.wait_for_event("popup", timeout=left or 1)
+        log("Popup A detected (new).")
         return popup
     except PWTimeout:
-        before = set(context.pages)
-        for _ in range(30):
-            time.sleep(0.15)
-            after = set(context.pages)
-            new_pages = list(after - before)
-            if new_pages:
-                log("Popup A detected via fallback.")
-                return new_pages[0]
-        raise RuntimeError("No popup detected after clicking Leg Print.")
+        pass
+
+    # Fallback: scan for any non-main page that looks like a print popup
+    for _ in range(20):
+        for p in context.pages:
+            if p == page or p.is_closed():
+                continue
+            try:
+                if popup_has_print_ui(p):
+                    log("Popup detected via scan (reuse).")
+                    return p
+            except Exception:
+                continue
+        time.sleep(0.15)
+
+    raise RuntimeError("No popup detected (new or reused) after clicking Leg Print.")
 
 def trigger_do_print(popupA):
     popupA.bring_to_front()
@@ -126,40 +165,39 @@ def trigger_do_print(popupA):
         popupA.wait_for_load_state("domcontentloaded", timeout=4000)
     except Exception:
         pass
-    # Try doPrint(); fallback toolbar
     try:
         if popupA.evaluate("() => typeof doPrint === 'function'"):
             popupA.evaluate("() => doPrint()")
-            log("Called doPrint() in Popup A.")
-            return
+            log("Called doPrint() in popup.")
+            return True
     except Exception:
         pass
     try:
         loc = popupA.locator("a[onclick*='doPrint'], a.locale-icon-print, span[title='Print']").first
         if loc.count():
             loc.click()
-            log("Clicked toolbar Print in Popup A.")
-            return
+            log("Clicked toolbar Print in popup.")
+            return True
     except Exception:
         pass
-    log("Warning: could not trigger doPrint() (will try other capture paths).")
+    log("Warning: could not trigger doPrint() (will still try capture paths).")
+    return False
 
 # -------------------- PDF capture (download + network sniff + request) --------------------
 
 def _remove_ctx_listener(context, event: str, handler):
     try:
-        # Playwright Python uses remove_listener, not off
-        context.remove_listener(event, handler)
+        context.remove_listener(event, handler)  # correct API in Playwright Python
     except Exception:
         pass
 
 def capture_pdf_bytes_after_doprint(context, popupA, timeout_ms=12000) -> Optional[bytes]:
     """
-    Obtain the PDF bytes after doPrint():
-    1) popupA.expect_download
-    2) context.expect_event('download')
-    3) sniff 'application/pdf' responses at context level
-    4) try requesting a visible PDF/DispoPrint URL via context.request
+    Obtain PDF bytes after doPrint(), robust across viewers:
+      1) popupA.expect_download
+      2) context.expect_event('download')
+      3) sniff 'application/pdf' responses on the context
+      4) request a visible .pdf/DispoPrint URL via context.request
     """
     pdf_bytes = {"data": None}
 
@@ -181,13 +219,13 @@ def capture_pdf_bytes_after_doprint(context, popupA, timeout_ms=12000) -> Option
 
     context.on("response", _on_response)
 
-    # Fire doPrint once
+    # Fire print (even if it returns False, keep going to capture any network/pdf)
     trigger_do_print(popupA)
 
     # 1) popup-level download
     try:
         with popupA.expect_download(timeout=timeout_ms//2) as dl_info:
-            pass  # already fired
+            pass
         dl = dl_info.value
         tmp = os.path.join(os.getcwd(), OUT_DIR); os.makedirs(tmp, exist_ok=True)
         temp_path = os.path.join(tmp, dl.suggested_filename or "label.pdf")
@@ -214,7 +252,7 @@ def capture_pdf_bytes_after_doprint(context, popupA, timeout_ms=12000) -> Option
     except Exception:
         pass
 
-    # 3) wait a bit for the response sniffer
+    # 3) wait briefly for the sniffer
     t0 = time.time()
     while (time.time() - t0) < (timeout_ms / 1000.0):
         if pdf_bytes["data"]:
@@ -224,11 +262,11 @@ def capture_pdf_bytes_after_doprint(context, popupA, timeout_ms=12000) -> Option
 
     _remove_ctx_listener(context, "response", _on_response)
 
-    # 4) last resort: try fetching visible PDF-like URL via context.request
+    # 4) last resort: try fetching a visible PDF URL via context.request
     try:
         url = (popupA.url or "")
         if url and (url.lower().endswith(".pdf") or "dispoprint" in url.lower()):
-            resp = context.request.get(url, headers={"Accept": "application/pdf,*/*"})
+            resp = context.request.get(url, headers={"Accept":"application/pdf,*/*"})
             if resp.ok and "application/pdf" in (resp.headers.get("content-type","").lower()):
                 return resp.body()
 
@@ -301,12 +339,26 @@ def split_pdf_ranges(pdf_bytes: bytes, ranges: List[List[int]]) -> List[Optional
 
 # -------------------- Per-doc runner (ALL Sumatra) --------------------
 
-def run_doc_sumatra(context, page, value: str, dn: str, doc_suffix: str, copies: int, fedex_special: bool=False):
+def run_doc_sumatra(context, page, value: str, dn: str, doc_suffix: str, copies: int,
+                    fedex_special: bool=False, last_popup_ref: dict=None):
+    """
+    last_popup_ref: a dict like {"popup": Page or None}; will reuse when Alpega does not open a new one.
+    """
     select_document(page, value)
     click_leg_print_button(page)
-    popupA = wait_for_first_popup(context, page)
 
-    # Always capture bytes (no kiosk)
+    existing = last_popup_ref.get("popup") if last_popup_ref else None
+    try:
+        popupA = wait_for_popup_or_reuse(context, page, existing_popup=existing, total_ms=7000)
+    except Exception as e:
+        log(f"{doc_suffix}: {e}")
+        return
+
+    # Store for next call
+    if last_popup_ref is not None:
+        last_popup_ref["popup"] = popupA
+
+    # Always capture bytes (no kiosk printing)
     data = capture_pdf_bytes_after_doprint(context, popupA, timeout_ms=15000)
     if not data:
         log(f"{doc_suffix}: could not obtain PDF; skipping.")
@@ -316,9 +368,9 @@ def run_doc_sumatra(context, page, value: str, dn: str, doc_suffix: str, copies:
     os.makedirs(out_dir, exist_ok=True)
 
     if fedex_special:
-        # FedEx: split ranges & print via Sumatra
+        # FedEx: page ranges
         reader = PdfReader(io.BytesIO(data))
-        total = len(reader.pages)
+        total  = len(reader.pages)
 
         # 1–2 (x2)
         part12 = split_pdf_ranges(data, [[1, min(2, total)]])[0]
@@ -339,7 +391,6 @@ def run_doc_sumatra(context, page, value: str, dn: str, doc_suffix: str, copies:
         else:
             log("FedEx: <5 pages; skipping 5..end set.")
     else:
-        # Generic: print all pages via Sumatra
         out_path = os.path.join(out_dir, f"{dn}_{doc_suffix}.pdf")
         save_bytes(out_path, data)
         silent_print(out_path, copies=copies)
@@ -356,7 +407,7 @@ def is_outside_netherlands() -> bool:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--cdp", default="http://localhost:9222", help="CDP URL for the already-running Edge")
+    ap.add_argument("--cdp", default="http://localhost:9222", help="CDP URL for already-running Edge")
     args = ap.parse_args()
 
     with sync_playwright() as p:
@@ -371,49 +422,67 @@ def main():
         log(f"Using current tab: {page.url}")
         ensure_detail_ready(page)
 
-        dn = get_sendung_number(page) or "document"
+        dn  = get_sendung_number(page) or "document"
         fwd = detect_forwarder(page)
         log(f"Forwarder: {fwd}")
 
+        # We'll reuse the same popup across multiple docs if Alpega does that.
+        last_popup_ref = {"popup": None}
+
         # ---- Routing (ALL via Sumatra) ----
         if fwd == "FEDEX":
-            # Special: FedEx Label with page ranges
-            run_doc_sumatra(context, page, "LABELXXQQXXlabelFedExWeb", dn, "FedExLabel", copies=1, fedex_special=True)
+            run_doc_sumatra(context, page, "LABELXXQQXXlabelFedExWeb", dn, "FedExLabel",
+                            copies=1, fedex_special=True, last_popup_ref=last_popup_ref)
 
         elif fwd == "DSV-AIR":
-            run_doc_sumatra(context, page, "LABELXXQQXXLabelCarrier", dn, "CarrierLabel", copies=1)
+            run_doc_sumatra(context, page, "LABELXXQQXXLabelCarrier", dn, "CarrierLabel",
+                            copies=1, last_popup_ref=last_popup_ref)
             if priority_is_S4():
-                run_doc_sumatra(context, page, "LOADINGLSTXXQQXXLoadinglist_empties", dn, "DockLoadingList", copies=2)
+                run_doc_sumatra(context, page, "LOADINGLSTXXQQXXLoadinglist_empties", dn, "DockLoadingList",
+                                copies=2, last_popup_ref=last_popup_ref)
 
         elif fwd == "DSV-ROAD":
-            run_doc_sumatra(context, page, "LABELXXQQXXLabelCarrier", dn, "CarrierLabel", copies=1)
-            run_doc_sumatra(context, page, "LOADINGLSTXXQQXXLoadinglist_empties", dn, "DockLoadingList", copies=1)
+            run_doc_sumatra(context, page, "LABELXXQQXXLabelCarrier", dn, "CarrierLabel",
+                            copies=1, last_popup_ref=last_popup_ref)
+            run_doc_sumatra(context, page, "LOADINGLSTXXQQXXLoadinglist_empties", dn, "DockLoadingList",
+                            copies=1, last_popup_ref=last_popup_ref)
             if is_outside_netherlands():
-                run_doc_sumatra(context, page, "LOADINGLSTXXQQXXLoadinglist_CMR_Def_Consol", dn, "CMR_Consol", copies=1)
+                run_doc_sumatra(context, page, "LOADINGLSTXXQQXXLoadinglist_CMR_Def_Consol", dn, "CMR_Consol",
+                                copies=1, last_popup_ref=last_popup_ref)
 
         elif fwd == "DGF":
-            run_doc_sumatra(context, page, "LABELXXQQXXLabelCarrier", dn, "CarrierLabel", copies=1)
+            run_doc_sumatra(context, page, "LABELXXQQXXLabelCarrier", dn, "CarrierLabel",
+                            copies=1, last_popup_ref=last_popup_ref)
 
         elif fwd == "DHL-EXP":
-            run_doc_sumatra(context, page, "LABELXXQQXXLabelDHL_Web", dn, "DHL_WebLabel", copies=1)
+            run_doc_sumatra(context, page, "LABELXXQQXXLabelDHL_Web", dn, "DHL_WebLabel",
+                            copies=1, last_popup_ref=last_popup_ref)
 
         elif fwd == "KNN":
-            run_doc_sumatra(context, page, "LABELXXQQXXLabelCarrier", dn, "CarrierLabel", copies=1)
+            run_doc_sumatra(context, page, "LABELXXQQXXLabelCarrier", dn, "CarrierLabel",
+                            copies=1, last_popup_ref=last_popup_ref)
 
         elif fwd == "MAERSK":
-            run_doc_sumatra(context, page, "LABELXXQQXXLabelCarrier", dn, "CarrierLabel", copies=1)
+            run_doc_sumatra(context, page, "LABELXXQQXXLabelCarrier", dn, "CarrierLabel",
+                            copies=1, last_popup_ref=last_popup_ref)
 
         elif fwd == "TROMP":
-            run_doc_sumatra(context, page, "LABELXXQQXXLabelCarrier", dn, "CarrierLabel", copies=1)
-            run_doc_sumatra(context, page, "LOADINGLSTXXQQXXLoadinglist_empties", dn, "DockLoadingList", copies=1)
+            run_doc_sumatra(context, page, "LABELXXQQXXLabelCarrier", dn, "CarrierLabel",
+                            copies=1, last_popup_ref=last_popup_ref)
+            run_doc_sumatra(context, page, "LOADINGLSTXXQQXXLoadinglist_empties", dn, "DockLoadingList",
+                            copies=1, last_popup_ref=last_popup_ref)
             if is_outside_netherlands():
-                run_doc_sumatra(context, page, "LOADINGLSTXXQQXXLoadinglist_CMR_Def_Consol", dn, "CMR_Consol", copies=1)
+                run_doc_sumatra(context, page, "LOADINGLSTXXQQXXLoadinglist_CMR_Def_Consol", dn, "CMR_Consol",
+                                copies=1, last_popup_ref=last_popup_ref)
 
         elif fwd == "VDB":
-            run_doc_sumatra(context, page, "LABELXXQQXXLabelCarrier", dn, "CarrierLabel", copies=1)
-            run_doc_sumatra(context, page, "LOADINGLSTXXQQXXLoadinglist_empties", dn, "DockLoadingList", copies=1)
+            run_doc_sumatra(context, page, "LABELXXQQXXLabelCarrier", dn, "CarrierLabel",
+                            copies=1, last_popup_ref=last_popup_ref)
+            run_doc_sumatra(context, page, "LOADINGLSTXXQQXXLoadinglist_empties", dn, "DockLoadingList",
+                            copies=1, last_popup_ref=last_popup_ref)
             if is_outside_netherlands():
-                run_doc_sumatra(context, page, "LOADINGLSTXXQQXXLoadinglist_CMR_Def_Consol", dn, "CMR_Consol", copies=1)
+                run_doc_sumatra(context, page, "LOADINGLSTXXQQXXLoadinglist_CMR_Def_Consol", dn, "CMR_Consol",
+                                copies=1, last_popup_ref=last_popup_ref)
 
         else:
             log("Unknown forwarder. No documents printed.")
