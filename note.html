@@ -6,7 +6,7 @@ import io
 import os
 import time
 import subprocess
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 from PyPDF2 import PdfReader, PdfWriter
@@ -21,8 +21,7 @@ def log(m): print(f"[phase2] {m}", flush=True)
 def get_current_order_page(context) -> Optional[object]:
     for p in context.pages:
         try:
-            if p.is_closed(): continue
-            if DETAIL_PATH_KEY in (p.url or ""):
+            if not p.is_closed() and DETAIL_PATH_KEY in (p.url or ""):
                 return p
         except Exception:
             pass
@@ -33,7 +32,6 @@ def ensure_detail_ready(page):
     page.locator("#elmtKopf\\.Geschaeftsfall").wait_for(state="attached", timeout=8000)
 
 def get_sendung_number(page) -> Optional[str]:
-    """Read SendungNrDfue -> e.g. '10069357' (used for filenames)."""
     try:
         loc = page.locator("input[name='SendungNrDfue']")
         if loc.count():
@@ -100,7 +98,6 @@ def wait_for_first_popup(context, page):
         log("Popup A detected.")
         return popup
     except PWTimeout:
-        # fallback: look for a new page
         before = set(context.pages)
         for _ in range(30):
             time.sleep(0.15)
@@ -112,7 +109,6 @@ def wait_for_first_popup(context, page):
         raise RuntimeError("No popup detected after clicking Leg Print.")
 
 def trigger_do_print(popupA) -> bool:
-    """Trigger doPrint() (or toolbar print) in Popup A."""
     popupA.bring_to_front()
     try:
         popupA.wait_for_load_state("domcontentloaded", timeout=4000)
@@ -137,7 +133,6 @@ def trigger_do_print(popupA) -> bool:
     return False
 
 def wait_for_label_view_after_do_print(context, popupA, timeout_ms=6000):
-    """Return the label page (new popup or the same popup if rendered inline)."""
     try:
         popupB = popupA.wait_for_event("popup", timeout=timeout_ms)
         try: popupB.wait_for_load_state("load", timeout=timeout_ms)
@@ -157,20 +152,18 @@ def wait_for_label_view_after_do_print(context, popupA, timeout_ms=6000):
             except: pass
             return popupB
 
-    # Some viewers render inline on Popup A
     return popupA
 
 # ---------- Kiosk printing (generic forwarders) ----------
 
 def print_all_copies(label_page, copies: int):
-    """Invoke window.print() in kiosk mode for the label page."""
     for _ in range(copies):
         ok = False
         try:
             label_page.evaluate("() => window.print && window.print()")
             ok = True
         except Exception:
-            # try child frames if any
+            # try child frames as a fallback
             for f in label_page.frames:
                 if f == label_page.main_frame: continue
                 try:
@@ -181,16 +174,12 @@ def print_all_copies(label_page, copies: int):
                     continue
         if not ok:
             log("Warning: window.print() failed on label page.")
-        time.sleep(0.35)
+        time.sleep(0.30)  # small gap to let kiosk print queue
     log(f"Requested {copies} copy/copies (kiosk mode).")
 
-# ---------- FedEx: robust download capture ----------
+# ---------- FedEx: robust doPrint download ----------
 
 def click_do_print_and_get_download(context, popupA, timeout_ms=12000):
-    """
-    Trigger doPrint() and capture the resulting Download.
-    Works whether the download is attached to the popup or the browser context.
-    """
     popupA.bring_to_front()
     try:
         popupA.wait_for_load_state("domcontentloaded", timeout=4000)
@@ -213,7 +202,6 @@ def click_do_print_and_get_download(context, popupA, timeout_ms=12000):
             pass
         return False
 
-    # Try popup-level first
     try:
         with popupA.expect_download(timeout=timeout_ms) as dl_info:
             _fire_print()
@@ -223,7 +211,6 @@ def click_do_print_and_get_download(context, popupA, timeout_ms=12000):
     except Exception:
         pass
 
-    # Fallback: context-level
     try:
         with context.expect_event("download", timeout=timeout_ms) as ev_info:
             _fire_print()
@@ -253,7 +240,6 @@ def split_pdf_ranges(pdf_bytes: bytes, ranges: List[List[int]]) -> List[Optional
     return outs
 
 def silent_print(pdf_path, copies=1):
-    """Silent single-sided print via SumatraPDF to default printer."""
     for _ in range(copies):
         try:
             subprocess.run(
@@ -283,19 +269,12 @@ def open_data_pdf_and_print(name: str, pdf_bytes: bytes, copies: int):
 # ---------- FedEx page-range orchestrator ----------
 
 def fedex_print_with_ranges(context, popupA, dn_number: str):
-    """
-    FedEx:
-      - print pages 1–2 twice
-      - print pages 5..end once (skip 3–4)
-    Capture single PDF via doPrint-download, split and silent-print via Sumatra.
-    """
     log("FedEx: capturing doPrint() download …")
     dl = click_do_print_and_get_download(context, popupA, timeout_ms=12000)
     if not dl:
         log("FedEx: no download captured; aborting FedEx range prints.")
         return
 
-    data = dl.save_as  # monkey check — we need bytes
     tmp_dir = os.path.join(os.getcwd(), "_alpega_tmp")
     os.makedirs(tmp_dir, exist_ok=True)
     path_full = os.path.join(tmp_dir, f"{dn_number}_full.pdf")
@@ -320,6 +299,32 @@ def fedex_print_with_ranges(context, popupA, dn_number: str):
             open_data_pdf_and_print(f"{dn_number}_pages5-end", part5n, copies=1)
     else:
         log("FedEx: document has <5 pages; skipping 5..end set.")
+
+# ---------- Cleanup (prevents 'must restart Edge') ----------
+
+def cleanup_after_run(context, keep_predicate) -> None:
+    """
+    Close all pages that do not satisfy `keep_predicate(url)`
+    and bring the kept page (main detail) to front.
+    """
+    kept = None
+    for p in list(context.pages):
+        try:
+            if p.is_closed():
+                continue
+            url = p.url or ""
+            if keep_predicate(url):
+                kept = p
+                continue
+            # Close popups/print/preview tabs we opened
+            p.close(run_before_unload=True)
+        except Exception:
+            continue
+    if kept:
+        try:
+            kept.bring_to_front()
+        except Exception:
+            pass
 
 # ---------- Placeholder flags (wire later) ----------
 
@@ -354,22 +359,40 @@ def main():
         fwd = detect_forwarder(page)
         log(f"Forwarder: {fwd}")
 
+        # Record the initial set of pages so we know what we created during this run
+        initial_pages = set(context.pages)
+
         def run_doc(value: str, copies: int, fedex_mode: bool = False):
             select_document(page, value)
             click_leg_print_button(page)
             popupA = wait_for_first_popup(context, page)
 
             if fedex_mode:
-                # FedEx: use download + split + Sumatra printing
                 fedex_print_with_ranges(context, popupA, dn_number)
+                # Close popup afterwards to avoid sticky state
+                try: 
+                    if not popupA.is_closed(): popupA.close(run_before_unload=True)
+                except: 
+                    pass
             else:
-                # Generic forwarders: kiosk printing (no downloads)
                 if not trigger_do_print(popupA):
                     log("Generic: could not trigger doPrint(); skipping.")
                     return
                 label_page = wait_for_label_view_after_do_print(context, popupA)
                 print_all_copies(label_page, copies)
+                # Close label_page and popup to avoid next-run issues
+                try:
+                    if label_page and not label_page.is_closed():
+                        label_page.close(run_before_unload=True)
+                except: 
+                    pass
+                try:
+                    if not popupA.is_closed():
+                        popupA.close(run_before_unload=True)
+                except:
+                    pass
 
+        # --- Routing ---
         if fwd == "FEDEX":
             run_doc("LABELXXQQXXlabelFedExWeb", copies=1, fedex_mode=True)
 
@@ -413,11 +436,14 @@ def main():
 
         log("Done.")
 
-        # NOTE:
-        # Leaving the connection open (no context.close()/browser.close())
-        # tends to work better across repeated runs with Edge + CDP.
-        # If you *still* find you must restart Edge, we can add selective cleanup
-        # behind a --cleanup flag that only detaches the CDP session.
+        # --- Hard cleanup of any pages created in this run (prevents restart need) ---
+        def _keep_pred(url: str) -> bool:
+            return (DETAIL_PATH_KEY in (url or ""))
+
+        cleanup_after_run(context, keep_predicate=_keep_pred)
+
+        # NOTE: We intentionally do NOT call context.close()/browser.close() so Edge keeps running.
+        # If you ever want a hard detach, add a --cleanup flag and call them conditionally.
 
 if __name__ == "__main__":
     main()
