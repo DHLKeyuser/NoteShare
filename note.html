@@ -1,17 +1,4 @@
 # file: alpega_phase2_print_attach_edge.py
-# usage:
-#   1) Start Edge:
-#      "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" ^
-#        --remote-debugging-port=9222 ^
-#        --kiosk-printing ^
-#        --user-data-dir="C:\Users\<YOUR_USERNAME>\AppData\Local\Microsoft\Edge\User Data"
-#   2) Open the order detail page (SendungBearbeitung) in that Edge.
-#   3) Run:
-#        python alpega_phase2_print_attach_edge.py
-#
-# Requirements:
-#   pip install playwright PyPDF2
-#   playwright install  (if not done before)
 
 import argparse
 import base64
@@ -32,8 +19,7 @@ def log(m): print(f"[phase2] {m}", flush=True)
 def get_current_order_page(context) -> Optional[object]:
     for p in context.pages:
         try:
-            if p.is_closed():
-                continue
+            if p.is_closed(): continue
             if DETAIL_PATH_KEY in (p.url or ""):
                 return p
         except Exception:
@@ -66,7 +52,7 @@ def detect_forwarder(page) -> str:
     if "tromp" in t: return "TROMP"
     if "boogard" in t or "boogaard" in t or "vdb" in t: return "VDB"
     if "kuehne" in t or "kühne" in t or "kuehne nagel" in t or "kuehne+nagel" in t or "knn" in t: return "KNN"
-    if "dhl" in t: return "DGF"  # conservative fallback for non-Express DHL/DGF
+    if "dhl" in t: return "DGF"  # generic DHL -> DGF
     return "UNKNOWN"
 
 # ---------- Doc selection + correct leg print button ----------
@@ -78,22 +64,17 @@ def select_document(page, value: str):
     log(f"Selected document value={value}")
 
 def click_leg_print_button(page):
-    # click the Leg Print button in the same cell/row as the select
     sel = page.locator("#elmtLeg\\.DokumenteDokumente")
     sel.wait_for(state="visible", timeout=15000)
     container = sel.locator("xpath=ancestor::td[1]")
-
     btn = container.locator("#aElmtBtnLegPrint")
     if not btn.count():
         btn = container.locator("#elmtBtnLegPrint")
-
     if btn.count():
         btn.first.scroll_into_view_if_needed()
         btn.first.click()
         log("Clicked Leg Print button within document area.")
         return
-
-    # fallback: app JS
     page.evaluate("() => (typeof clickGuiButton==='function') && clickGuiButton('BtnLegPrint')")
     log("Fallback: invoked clickGuiButton('BtnLegPrint').")
 
@@ -132,16 +113,12 @@ def click_do_print_in_popupA(popup):
                     return True
                 except Exception:
                     return True
-            # fallback to anchor
             try:
                 loc = popup.locator("a[onclick*='doPrint'], a.locale-icon-print, span[title='Print']").first
-                try:
-                    if loc.count():
-                        loc.click()
-                        log("Clicked toolbar Print in Popup A.")
-                        return True
-                except Exception:
-                    pass
+                if loc.count():
+                    loc.click()
+                    log("Clicked toolbar Print in Popup A.")
+                    return True
             except Exception:
                 pass
         except Exception:
@@ -190,30 +167,54 @@ def print_all_copies(label_page, copies: int):
         try:
             label_page.evaluate("() => window.print && window.print()")
         except Exception:
-            # try any sub-frames too
-            printed = False
+            # try sub-frames
+            done = False
             for f in label_page.frames:
-                if f == label_page.main_frame:
-                    continue
+                if f == label_page.main_frame: continue
                 try:
                     f.evaluate("() => window.print && window.print()")
-                    printed = True
+                    done = True
                     break
                 except:
                     continue
-            if not printed:
+            if not done:
                 log("Warning: window.print() failed on label page.")
         time.sleep(0.7)
     log(f"Requested {copies} copy/copies (all pages).")
 
-# ---------- FedEx special: obtain PDF & split ----------
+# ---------- FedEx: obtain PDF bytes (NEW: direct request via context) ----------
 
-def try_fetch_pdf_bytes_direct(label_page) -> Optional[bytes]:
-    """Direct fetch of current URL (may be CORS-blocked by viewer)."""
+def try_request_pdf_via_context(context, label_page) -> Optional[bytes]:
+    """
+    Fetch the label PDF with Playwright's APIRequestContext bound to the same browser context.
+    This bypasses in-page CORS/viewer quirks and uses the same cookies.
+    """
     try:
         url = label_page.url
-        if not url:
+        if not url: return None
+        # best-effort user-agent + referer
+        try:
+            ua = label_page.evaluate("() => navigator.userAgent") or "Mozilla/5.0"
+        except:
+            ua = "Mozilla/5.0"
+        headers = {
+            "Accept": "application/pdf,application/octet-stream;q=0.9,*/*;q=0.8",
+            "Referer": url,
+            "User-Agent": ua,
+        }
+        resp = context.request.get(url, headers=headers)
+        ctype = (resp.headers.get("content-type") or "").lower()
+        if not resp.ok or "application/pdf" not in ctype:
             return None
+        return resp.body()
+    except Exception:
+        return None
+
+def try_fetch_pdf_bytes_direct(label_page) -> Optional[bytes]:
+    """In-page fetch (may be CORS-blocked)."""
+    try:
+        url = label_page.url
+        if not url: return None
         b64 = label_page.evaluate(
             """async (u) => {
                 try {
@@ -228,14 +229,13 @@ def try_fetch_pdf_bytes_direct(label_page) -> Optional[bytes]:
             }""",
             url
         )
-        if not b64:
-            return None
+        if not b64: return None
         return base64.b64decode(b64)
     except Exception:
         return None
 
 def try_click_download_and_get_pdf_bytes(label_page) -> Optional[bytes]:
-    """Best-effort for environments with a real browser download; your viewer uses native Save, so this usually won't fire."""
+    """For environments with real browser download buttons (yours likely uses native Save dialog)."""
     download_selectors = [
         "cr-icon-button[aria-label='Download']",
         "cr-icon-button[title='Download']",
@@ -245,7 +245,7 @@ def try_click_download_and_get_pdf_bytes(label_page) -> Optional[bytes]:
         "a:has-text('Download')",
         "a[onclick*='download']",
         "button[onclick*='download']",
-        "button#save",   # your viewer's "Save (Ctrl+S)" – note: opens OS dialog, so expect_download won't fire
+        "button#save",  # native Save dialog -> expect_download usually won't fire
     ]
     try:
         with label_page.expect_download(timeout=8000) as dl_info:
@@ -285,16 +285,14 @@ def try_click_download_and_get_pdf_bytes(label_page) -> Optional[bytes]:
         return None
 
 def try_capture_pdf_via_reload(label_page, context, timeout_ms=12000) -> Optional[bytes]:
-    """
-    Reload the label page and capture the PDF bytes from the network response
-    (works even when fetch is blocked and Save is a native dialog).
-    """
+    """Reload label page and watch network for the PDF response (no page.off dependency)."""
     pdf_blob = {"data": None}
+
     def _on_response(resp):
         try:
             ctype = (resp.headers.get("content-type") or "").lower()
             url = (resp.url or "").lower()
-            if "application/pdf" in ctype or url.endswith(".pdf") or "dispoprint" in url:
+            if ("application/pdf" in ctype) or url.endswith(".pdf") or ("dispoprint" in url):
                 if resp.request.frame == label_page.main_frame:
                     body = resp.body()
                     if body and len(body) > 0:
@@ -303,19 +301,29 @@ def try_capture_pdf_via_reload(label_page, context, timeout_ms=12000) -> Optiona
             pass
 
     label_page.on("response", _on_response)
+    if hasattr(label_page, "off"):
+        remove_listener = lambda: label_page.off("response", _on_response)
+    elif hasattr(label_page, "remove_listener"):
+        remove_listener = lambda: label_page.remove_listener("response", _on_response)
+    else:
+        remove_listener = lambda: None
+
     try:
-        label_page.reload(wait_until="load", timeout=timeout_ms)
-    except Exception:
-        pass
+        try:
+            label_page.reload(wait_until="load", timeout=timeout_ms)
+        except Exception:
+            pass
+        t0 = time.time()
+        while (time.time() - t0) < (timeout_ms / 1000):
+            if pdf_blob["data"]:
+                break
+            time.sleep(0.1)
+        return pdf_blob["data"]
+    finally:
+        try: remove_listener()
+        except: pass
 
-    t0 = time.time()
-    while (time.time() - t0) < (timeout_ms / 1000):
-        if pdf_blob["data"]:
-            break
-        time.sleep(0.1)
-
-    label_page.off("response", _on_response)
-    return pdf_blob["data"]
+# ---------- Split & print helpers ----------
 
 def split_pdf_ranges(pdf_bytes: bytes, ranges: List[List[int]]) -> List[Optional[bytes]]:
     outs = []
@@ -344,30 +352,37 @@ def open_data_pdf_and_print(context, name: str, pdf_bytes: bytes, copies: int):
     page.goto("file:///" + path.replace("\\", "/"), wait_until="load")
     print_all_copies(page, copies)
     time.sleep(1.2)
-    try:
-        page.close()
-    except:
-        pass
+    try: page.close()
+    except: pass
+
+# ---------- FedEx page-range orchestrator ----------
 
 def fedex_print_with_ranges(context, label_page):
     """
     FedEx:
       - print pages 1–2 twice
       - print pages 5..end once (skip 3–4)
+    New primary method: request the PDF via context.request (cookie-aware, no CORS).
     """
-    log("FedEx: obtaining PDF via network capture (reload).")
-    pdf_bytes = try_capture_pdf_via_reload(label_page, context, timeout_ms=15000)
+    # 1) NEW: direct request using the context (shares cookies with the browser)
+    log("FedEx: requesting PDF via context.request().")
+    pdf_bytes = try_request_pdf_via_context(context, label_page)
+
+    # 2) Fallbacks
+    if not pdf_bytes:
+        log("FedEx: context.request failed; trying reload capture…")
+        pdf_bytes = try_capture_pdf_via_reload(label_page, context, timeout_ms=15000)
 
     if not pdf_bytes:
-        log("FedEx: reload capture didn’t return PDF; trying direct fetch (may be CORS-blocked).")
+        log("FedEx: reload capture failed; trying in-page fetch (may be CORS-blocked)…")
         pdf_bytes = try_fetch_pdf_bytes_direct(label_page)
 
     if not pdf_bytes:
-        log("FedEx: no PDF from reload or fetch; trying viewer Download button…")
+        log("FedEx: still no PDF; trying viewer Download (may be native dialog)…")
         pdf_bytes = try_click_download_and_get_pdf_bytes(label_page)
 
     if not pdf_bytes:
-        log("FedEx: could not obtain PDF (no capture/fetch/download). Skipping prints to avoid wrong pages.")
+        log("FedEx: could not obtain PDF by any method. Stopping FedEx range prints to avoid wrong pages.")
         return
 
     reader = PdfReader(io.BytesIO(pdf_bytes))
@@ -403,7 +418,7 @@ def is_outside_netherlands() -> bool:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--cdp", default="http://localhost:9222",
-                    help="CDP URL for the already-running Edge (started with --remote-debugging-port + --kiosk-printing)")
+                    help="CDP URL for the already-running Edge (start with --remote-debugging-port + --kiosk-printing)")
     args = ap.parse_args()
 
     with sync_playwright() as p:
