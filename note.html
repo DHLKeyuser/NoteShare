@@ -1,419 +1,401 @@
-import os, re, time, json, ctypes, logging
-from typing import List, Dict, Any, Optional, Tuple
-import fitz  # PyMuPDF
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
+# file: alpega_phase2_print_attach_edge.py
+# usage:
+#   Open the order detail tab in Edge (SendungBearbeitung) -> run:
+#     python alpega_phase2_print_attach_edge.py
+#
+# Notes:
+# - Attaches to your running Edge (started with --remote-debugging-port=9222 and --kiosk-printing).
+# - No Save clicks.
+# - Forwarder-specific document selection + print logic.
+# - FedEx: pages 1–2 x2, pages 5..end x1 (skips 3–4) via PDF split & silent print.
+# - DSV AIR: Carrier Label x1; Dock Loading List x2 if PRIORITY=S4 (placeholder).
+# - DSV ROAD: Carrier Label x1; Dock Loading List x1; CMR Consol x1 if OUTSIDE_NL (placeholder).
+# - TROMP/VDB mirror DSV ROAD; DGF/KNN/MAERSK: Carrier Label x1; DHL Express: DHL Web Label x1.
 
-# ─── CONFIG ──────────────────────────────────────────────────────────────
-DOWNLOADS_FOLDER = os.path.join(os.environ["USERPROFILE"], "Downloads")
-FILENAME_REGEX   = re.compile(r"^\d{8}\.pdf$", re.IGNORECASE)
+import argparse
+import base64
+import io
+import os
+import time
+from typing import Optional, List
 
-STABLE_POLLS  = 3
-POLL_INTERVAL = 0.10
-TIMEOUT       = 5.0
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+from PyPDF2 import PdfReader, PdfWriter
 
-WRITE_JSON_REPORT = True     # write <file>.check.json
-DEBUG_DUMP = True            # write <file>.txt with extracted text
-LOGLEVEL = logging.INFO
+DETAIL_PATH_KEY = "/ls/vsa/servlet/SendungBearbeitung"
 
-FORBIDDEN_UNIT_PRICES = {0.0, 0.1, 0.11, 0.01}
-NUM_RE = r"[-+]?\d+(?:[.,]\d+)?"
+def log(m): print(f"[phase2] {m}", flush=True)
 
-# EU country names (tolerant to common variants)
-EU_ALIASES = {
-    "AUSTRIA","BELGIUM","BULGARIA","CROATIA","CYPRUS","CZECHIA","CZECH REPUBLIC","DENMARK",
-    "ESTONIA","FINLAND","FRANCE","GERMANY","GREECE","HUNGARY","IRELAND","ITALY","LATVIA",
-    "LITHUANIA","LUXEMBOURG","MALTA","NETHERLANDS","THE NETHERLANDS","POLAND","PORTUGAL",
-    "ROMANIA","SLOVAKIA","SLOVENIA","SPAIN","SWEDEN"
-}
+# ---------- Helpers: page/context ----------
 
-# ─── LOGGING ─────────────────────────────────────────────────────────────
-logging.basicConfig(level=LOGLEVEL, format="%(asctime)s %(levelname)-8s %(message)s", datefmt="%H:%M:%S")
-
-# ─── PDF → TEXT ─────────────────────────────────────────────────────────
-def extract_text(pdf_path: str) -> str:
-    doc = fitz.open(pdf_path)
-    parts = []
-    total = len(doc)
-    for i, page in enumerate(doc, 1):
-        parts.append(f"\n----- Page {i}/{total} -----\n{page.get_text('text')}")
-    doc.close()
-    text = "".join(parts)
-    if DEBUG_DUMP:
+def get_current_order_page(context) -> Optional[object]:
+    for p in context.pages:
         try:
-            with open(pdf_path + ".txt", "w", encoding="utf-8") as f:
-                f.write(text)
-        except Exception as e:
-            logging.warning("Couldn't write debug dump: %s", e)
-    # normalize NBSP and thin spaces so regex sees clean numbers/words
-    text = text.replace("\u00A0", " ").replace("\u202F", " ")
-    return text
-
-# ─── HELPERS ────────────────────────────────────────────────────────────
-def to_float(s: Optional[str]) -> Optional[float]:
-    if not s: return None
-    s = s.replace("\u00A0", " ").replace(" ", "")
-    if "," in s and "." in s:
-        s = s.replace(".", "").replace(",", ".") if s.rfind(",") > s.rfind(".") else s.replace(",", "")
-    else:
-        if s.count(",") == 1 and len(s) > 3 and s[-3] == ",":
-            s = s.replace(",", ".")
-        else:
-            s = s.replace(",", "")
-    try: return float(s)
-    except Exception: return None
-
-def _strip_all_spaces(s: str) -> str:
-    # remove normal spaces, NBSP, thin spaces, tabs, etc.
-    return re.sub(r"[\s\u00A0\u202F]+", "", s)
-
-def between(text: str, start_pat: str, end_pat: str) -> Optional[str]:
-    flags = re.IGNORECASE | re.MULTILINE | re.DOTALL
-    m = re.search(start_pat, text, flags)
-    if not m: return None
-    tail = text[m.end():]
-    m2 = re.search(end_pat, tail, flags)
-    return tail[:m2.start()] if m2 else tail
-
-def clean_caps(s: str) -> str:
-    return re.sub(r"[^A-Z ]+", " ", (s or "").upper()).strip()
-
-# ─── TOP-LEVEL FIELDS ───────────────────────────────────────────────────
-def parse_sold_to(text: str) -> str:
-    blk = between(
-        text,
-        r"\bSold\s+to\b",
-        r"\bDelivery\s+Ship\s+to\b|^Item\s+Part\s+number\b|^Incoterms\b|^Ship\s+from\b"
-    )
-    return (blk or "").strip()
-
-def sold_to_has_asml(sold_to: str) -> bool:
-    return "ASML" in (sold_to or "").upper()
-
-def guess_country_from_sold_to(sold_to: str) -> Optional[str]:
-    """Pick country from the bottom of the Sold-to block using word-boundary matches.
-       Looks at last 3 lines; falls back to last non-empty line (trim after comma)."""
-    if not sold_to:
-        return None
-
-    lines = [ln.strip() for ln in sold_to.splitlines() if ln.strip()]
-    tail = [l.upper() for l in lines[-3:]]
-
-    # 1) Prefer explicit EU names from your EU_ALIASES set
-    for token in sorted(EU_ALIASES, key=len, reverse=True):
-        pat = r"\b" + re.escape(token) + r"\b"
-        for ln in tail:
-            if re.search(pat, ln):
-                return token
-
-    # 2) Common non-EU names with safe word boundaries (optional hints)
-    NON_EU_HINTS = [
-        "UNITED KINGDOM","NORTHERN IRELAND","UNITED STATES","UNITED ARAB EMIRATES","NEW ZEALAND",
-        "SOUTH AFRICA","SAUDI ARABIA","CZECH REPUBLIC","NORTH MACEDONIA","SWITZERLAND","ICELAND",
-        "NORWAY","TURKEY","SERBIA","ALBANIA","MOLDOVA","UKRAINE","BELARUS","RUSSIA","CANADA",
-        "MEXICO","BRAZIL","CHINA","TAIWAN","JAPAN","SINGAPORE","MALAYSIA","INDIA","ISRAEL",
-        "AUSTRALIA","HONG KONG","KOREA","KOREA REP","U.S.A."
-    ]
-    for token in NON_EU_HINTS:
-        pat = r"\b" + re.escape(token) + r"\b"
-        for ln in tail:
-            if re.search(pat, ln):
-                return token
-
-    # 3) Fallback: last non-empty line (often just the country), trim after comma
-    if lines:
-        last = lines[-1].upper()
-        if "," in last:
-            last = last.split(",")[0]
-        return last
+            if p.is_closed(): continue
+            if DETAIL_PATH_KEY in (p.url or ""):
+                return p
+        except Exception:
+            pass
     return None
 
-def is_country_in_eu(country_name: Optional[str]) -> Optional[bool]:
-    if not country_name: return None
-    c = clean_caps(country_name)
-    return c in EU_ALIASES
+def ensure_detail_ready(page):
+    page.bring_to_front()
+    page.locator("#elmtKopf\\.Geschaeftsfall").wait_for(state="attached", timeout=20000)
 
-def parse_incoterm(text: str) -> Optional[str]:
-    line = between(text, r"^Incoterms\b[^\n]*\n", r"\n")
-    if not line: line = between(text, r"^Incoterms\b\s*", r"\n")
-    if not line: return None
-    return (line.strip().split() or [None])[0]
+# ---------- Forwarder detection (legs table) ----------
 
-def parse_document(text: str) -> Optional[str]:
-    line = between(text, r"^Document\b[^\n]*\n", r"\n")
-    if not line: line = between(text, r"^Document\b\s*", r"\n")
-    if not line: return None
-    m = re.search(r"\b\d{6,}\b", line)
-    return m.group(0) if m else None
-
-def parse_currency(text: str) -> Optional[str]:
-    m = re.search(r"^Currency\s*:\s*([A-Z]{3})\b", text, re.IGNORECASE | re.MULTILINE)
-    return m.group(1).upper() if m else None
-
-# ─── ITEMS ──────────────────────────────────────────────────────────────
-# Accept numbers with optional thousands (.,) and optional decimal (.,)
-PRICE_TOKEN_RE = re.compile(
-   r"^[-+]?\d{1,3}(?:[.,]\d{3})*(?:[.,]\d+)?$"   # e.g. 1,234.56  or 1.234,56
-   r"|^[-+]?\d+(?:[.,]\d+)?$"                    # e.g. 1234.56  or 1234,56
-)
-GRAND_TOTAL_RE = rf"(?m)^Total\s+Amount\s*(?:\n\s*{NUM_RE}\b|\s+{NUM_RE}\b)"  # must have a number nearby
-PACKAGING_RE   = r"(?m)^Packaging\s+details\b"
-
-def split_item_blocks(text: str) -> List[str]:
-    starts = [m.start() for m in re.finditer(r"(?m)^\s*\d{3}\s+\S+", text)]
-    if not starts: return []
-    blocks: List[str] = []
-    for i, s in enumerate(starts):
-        e = starts[i+1] if i+1 < len(starts) else len(text)
-        g = re.search(GRAND_TOTAL_RE, text[s:e])
-        if g: e = s + g.start()
-        p = re.search(PACKAGING_RE, text[s:e])
-        if p: e = s + p.start()
-        blocks.append(text[s:e].strip())
-    return blocks
-
-def parse_item_block(block: str) -> Dict[str, Any]:
-    lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
-    head = lines[0] if lines else ""
-    m = re.match(r"^(\d{3})\s+(.+)$", head)
-    seq, part = (m.group(1), m.group(2)) if m else (None, None)
-    desc = lines[1] if len(lines) > 1 else None
-
-    qty, unit = None, None
-    for ln in lines[2:6]:
-        m = re.search(rf"\b({NUM_RE})\s+([A-Z]{{1,4}})\b", ln)
-        if m: qty = to_float(m.group(1)); unit = m.group(2); break
-
-    # unit price & line total as subsequent standalone numbers
-    unit_price = line_total = None
-    if qty is not None:
-        nums = []
-        for ln in lines:
-            s = _strip_all_spaces(ln)  # strips spaces, NBSP, thin spaces
-            if PRICE_TOKEN_RE.fullmatch(s):
-                nums.append(s)
-        if len(nums) >= 2:
-            unit_price = to_float(nums[0])
-            line_total  = to_float(nums[1])
-
-    coo = None
-    for ln in lines:
-        m = re.search(r"\bCoO\s*:\s*([A-Z]{2,3})\b", ln, re.IGNORECASE)
-        if m: coo = m.group(1).upper(); break
-
-    ht_codes = re.findall(r"\b[A-Z]{2}\s+HT\s*:\s*([0-9A-Za-z]+)", block, re.IGNORECASE)
-
-    return {
-        "seq": seq, "part_number": part, "description": desc,
-        "qty": qty, "unit": unit, "unit_price": unit_price, "line_total": line_total,
-        "coo": coo, "ht_codes": ht_codes, "raw": block,
-    }
-
-def parse_items(text: str) -> List[Dict[str, Any]]:
-    return [parse_item_block(b) for b in split_item_blocks(text)]
-
-# ─── PACKAGING ───────────────────────────────────────────────────────────
-def parse_packaging(text: str) -> Dict[str, Any]:
-    blk = between(text, r"^Packaging\s+details\b", r"^---|\Z")
-    out = {"colli": None, "dims": None, "weight_kg": None}
-    if not blk: return out
-    m = re.search(r"(?m)^Colli\s*$", blk)
-    tail = blk[m.end():] if m else blk
-    m2 = re.search(r"\b(\d{6,})\b", tail)
-    if m2: out["colli"] = m2.group(1)
-    m3 = re.search(rf"({NUM_RE})\s*[x×]\s*({NUM_RE})\s*[x×]\s*({NUM_RE})\s*[mM]?\b", blk)
-    if m3: out["dims"] = tuple(to_float(m3.group(i)) for i in (1,2,3))
-    m4 = re.search(rf"({NUM_RE})\s*KG\b", blk, re.IGNORECASE)
-    if m4: out["weight_kg"] = to_float(m4.group(1))
-    return out
-
-# ─── CHECKS (with ASML/EU matrix) ───────────────────────────────────────
-def check_invoice(text: str, filename_dn: Optional[str]) -> List[str]:
-    issues: List[str] = []
-
-    sold = parse_sold_to(text) or ""
-    has_asml = sold_to_has_asml(sold)
-
-    sold_country = guess_country_from_sold_to(sold)
-    in_eu_opt = is_country_in_eu(sold_country)
-    outside_eu = (in_eu_opt is False)  # None = unknown → treat as not outside-specific rules
-
-    incoterm = parse_incoterm(text)
-    document = parse_document(text)
-    currency  = parse_currency(text)
-
-    if not sold.strip(): issues.append("Sold to: block missing.")
-    if not incoterm:    issues.append("Incoterms: missing or malformed (need first word below).")
-    if not document:    issues.append("Document: DN number missing.")
+def detect_forwarder(page) -> str:
+    legs_tbl = page.locator("#TableLegs")
+    text = ""
+    if legs_tbl.count() > 0:
+        legs_tbl.wait_for(state="visible", timeout=20000)
+        text = legs_tbl.inner_text().lower()
     else:
-        if filename_dn and document != filename_dn:
-            issues.append(f"Document: DN {document} ≠ filename {filename_dn}.")
-    if not currency:    issues.append("Currency: missing 'Currency: XXX' line.")
-    if in_eu_opt is None:
-        issues.append("Sold to: country not confidently detected (EU/non-EU rules may be skipped).")
+        rows = page.locator("tr.table-list-row--border")
+        rows.first.wait_for(state="visible", timeout=20000)
+        text = "\n".join(rows.all_text_contents()).lower()
 
-    # Decide rule set
-    require_coo = False
-    require_two_ht = False
-    apply_under_1_eur = False
+    # normalize
+    t = text
+    if "fedex" in t: return "FEDEX"
+    if "dhl express" in t or "dhl express" in t: return "DHL-EXP"
+    if "dhl" in t and "express" not in t: return "DGF"  # conservative (you can refine)
+    if "dsv" in t and "air" in t: return "DSV-AIR"
+    if "dsv" in t and "road" in t: return "DSV-ROAD"
+    if "kuehne" in t or "kühne" in t or "kn" in t or "k+N" in t or "k-n" in t or "kuehne+nagel" in t or "kuehne nagel" in t or "knn" in t: return "KNN"
+    if "maersk" in t: return "MAERSK"
+    if "tromp" in t: return "TROMP"
+    if "boogard" in t or "v.d. boogaard" in t or "vdb" in t or "boogaard" in t: return "VDB"
 
-    if outside_eu and has_asml:
-        require_coo = True
-        require_two_ht = True
-        apply_under_1_eur = True
-    elif outside_eu and not has_asml:
-        require_coo = True
-        require_two_ht = False
-        apply_under_1_eur = True
-    elif (in_eu_opt is True) and (not has_asml):
-        # EU + no ASML: no CoO/HT mandates, no <1€ rule
+    return "UNKNOWN"
+
+# ---------- Doc selection + correct leg print button ----------
+
+def select_document(page, value: str):
+    sel = page.locator("#elmtLeg\\.DokumenteDokumente")
+    sel.wait_for(state="visible", timeout=15000)
+    sel.select_option(value=value)
+    log(f"Selected document value={value}")
+
+def click_leg_print_button(page):
+    sel = page.locator("#elmtLeg\\.DokumenteDokumente")
+    sel.wait_for(state="visible", timeout=15000)
+    container = sel.locator("xpath=ancestor::td[1]")
+    btn = container.locator("#aElmtBtnLegPrint")
+    if not btn.count():
+        btn = container.locator("#elmtBtnLegPrint")
+    if btn.count():
+        btn.first.scroll_into_view_if_needed()
+        btn.first.click()
+        log("Clicked Leg Print button within document area.")
+        return
+    page.evaluate("() => (typeof clickGuiButton==='function') && clickGuiButton('BtnLegPrint')")
+    log("Fallback: invoked clickGuiButton('BtnLegPrint').")
+
+# ---------- Popup A (toolbar with doPrint) ----------
+
+def wait_for_first_popup(context, page):
+    try:
+        popup = page.wait_for_event("popup", timeout=10000)
+        log("Popup A (toolbar) opened via event.")
+        return popup
+    except PWTimeout:
+        before = set(context.pages)
+        for _ in range(40):
+            time.sleep(0.25)
+            after = set(context.pages)
+            new_pages = list(after - before)
+            if new_pages:
+                log("Popup A (toolbar) detected via new-tab fallback.")
+                return new_pages[0]
+        raise RuntimeError("No popup detected after clicking Leg Print.")
+
+def click_do_print_in_popupA(popup):
+    popup.bring_to_front()
+    try:
+        popup.wait_for_load_state("domcontentloaded", timeout=8000)
+    except:
         pass
-    else:
-        # Any other ambiguous combo: keep defaults (forbidden price rule still applies)
-        pass
-
-    # Items
-    items = parse_items(text)
-    if not items:
-        issues.append("Items: no item blocks found.")
-    else:
-        for it in items:
-            tag = f"Item {it.get('seq') or '?'} ({it.get('part_number') or 'unknown'})"
-
-            if it["qty"] is None:
-                issues.append(f"{tag}: Qty missing.")
-            if it["unit_price"] is None:
-                issues.append(f"{tag}: Unit Price missing.")
-            else:
-                up = round(it["unit_price"], 2)
-                if up in FORBIDDEN_UNIT_PRICES:
-                    issues.append(f"{tag}: Unit Price is {up:.2f} (Please check).")
-                if apply_under_1_eur and up < 1.00:
-                    issues.append(f"{tag}: Unit Price {up:.2f}, What is under 1 euro")
-            if it["line_total"] is None:
-                issues.append(f"{tag}: Line total missing.")
-            if all(v is not None for v in (it["qty"], it["unit_price"], it["line_total"])):
-                calc = round(it["qty"] * it["unit_price"], 2)
-                if abs(calc - round(it["line_total"], 2)) > 0.02:
-                    issues.append(f"{tag}: Qty × Unit Price ({calc:.2f}) ≠ Line Total ({it['line_total']:.2f}).")
-
-            if require_coo and not it["coo"]:
-                issues.append(f"{tag}: CoO missing (required for this Sold-to).")
-            if require_two_ht and len(it["ht_codes"]) < 2:
-                issues.append(f"{tag}: Fewer than two HT codes (found {len(it['ht_codes'])}).")
-
-    # Packaging (always)
-    pkg = parse_packaging(text)
-    if not pkg["colli"]:
-        issues.append("Packaging: Colli number missing.")
-    if not pkg["dims"]:
-        issues.append("Packaging: Dimensions missing.")
-    if not pkg["weight_kg"]:
-        issues.append("Packaging: Weight missing.")
-
-    # Heuristics for anomalies
-    dims = pkg["dims"]; w = pkg["weight_kg"]
-    if dims:
-        L, W, H = dims
-        for d in dims:
-            if d is not None and (d > 3.0 or d < 0.03):
-                issues.append(f"Packaging: Dimension {d} m looks abnormal.")
-        if w is not None:
-            max_dim = max(L, W, H); second = sorted(dims)[-2]
-            if w >= 15 and max_dim <= 0.8 and second <= 0.6:
-                issues.append("Packaging: ≥15 kg should not be in a small box (expect pallet-like dimensions).")
-            if max_dim >= 1.5 and w <= 2:
-                issues.append("Packaging: Very large dimensions with very low weight — verify.")
-
-    return issues
-
-# ─── UI ─────────────────────────────────────────────────────────────────
-def popup(title: str, msg: str):
-    try: ctypes.windll.user32.MessageBoxW(0, msg, title, 0x30)
-    except Exception: logging.warning("Popup failed (non-Windows env?): %s", title)
-
-# ─── FILE STABILITY ─────────────────────────────────────────────────────
-def wait_for_stable(path: str) -> bool:
-    last, stable = -1, 0
-    deadline = time.time() + TIMEOUT
+    deadline = time.time() + 5.0
     while time.time() < deadline:
-        try: sz = os.path.getsize(path)
-        except Exception: sz = -1
-        if sz == last and sz > 0:
-            stable += 1
-            if stable >= STABLE_POLLS: return True
-        else:
-            stable = 0; last = sz
-        time.sleep(POLL_INTERVAL)
+        try:
+            has_do_print = popup.evaluate("() => typeof doPrint === 'function'")
+            if has_do_print:
+                try:
+                    popup.evaluate("() => doPrint()")
+                    log("Called doPrint() in Popup A via JS.")
+                    return True
+                except Exception:
+                    return True
+            # fallback anchor
+            try:
+                loc = popup.locator("a[onclick*='doPrint'], a.locale-icon-print, span[title='Print']").first
+                try:
+                    if loc.count():
+                        loc.click()
+                        log("Clicked toolbar Print in Popup A.")
+                        return True
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        except Exception:
+            pass
+        time.sleep(0.2)
+    log("Could not trigger doPrint() in Popup A within timeout.")
     return False
 
-# ─── WATCHER ────────────────────────────────────────────────────────────
-class Handler(FileSystemEventHandler):
-    def __init__(self): self._seen = set()
+def wait_for_label_view_after_do_print(context, popupA):
+    try:
+        popupB = popupA.wait_for_event("popup", timeout=6000)
+        log("Popup B (label) opened via event.")
+        try: popupB.wait_for_load_state("load", timeout=10000)
+        except: pass
+        return popupB
+    except Exception:
+        pass
 
-    def _try_process(self, path: str):
-        fname = os.path.basename(path)
-        if not FILENAME_REGEX.match(fname) or path in self._seen: return
-        logging.info(f"→ Candidate detected: {fname}")
-        if not wait_for_stable(path):
-            logging.error(f"File never stabilized: {fname}"); return
+    before = set(context.pages)
+    for _ in range(24):
+        time.sleep(0.25)
+        after = set(context.pages)
+        new_pages = list(after - before)
+        if new_pages:
+            popupB = new_pages[0]
+            log("Popup B (label) detected as a new tab.")
+            try: popupB.wait_for_load_state("load", timeout=10000)
+            except: pass
+            return popupB
 
-        self._seen.add(path); logging.info(f"Processing {fname}…")
+    try:
+        url = (popupA.url or "").lower()
+    except:
+        url = ""
+    if "pdf" in url or url.endswith(".pdf"):
+        log("Label appears to be loaded in Popup A (PDF URL).")
+        return popupA
+
+    log("Assuming label loaded in Popup A (no new popup detected).")
+    return popupA
+
+# ---------- Generic print (kiosk: always silent) ----------
+
+def print_all_copies(label_page, copies: int):
+    for i in range(copies):
         try:
-            text = extract_text(path)
-            if len(text.strip()) < 30:
-                popup("Invoice Warning", f"{fname}: very little text (scanned PDF?).")
-                logging.warning("%s looks scanned (no text).", fname)
-
-            base = os.path.splitext(fname)[0]
-            filename_dn = base if re.fullmatch(r"\d{8}", base) else None
-            issues = check_invoice(text, filename_dn)
-
-            if WRITE_JSON_REPORT:
-                sidecar = {
-                    "file": fname,
-                    "document_dn": parse_document(text),
-                    "incoterm": parse_incoterm(text),
-                    "currency": parse_currency(text),
-                    "sold_to": parse_sold_to(text),
-                    "sold_to_country": guess_country_from_sold_to(parse_sold_to(text)),
-                    "in_eu": is_country_in_eu(guess_country_from_sold_to(parse_sold_to(text))),
-                    "items": [ib for ib in parse_items(text)],
-                    "packaging": parse_packaging(text),
-                    "issues": issues
-                }
+            label_page.evaluate("() => window.print && window.print()")
+        except Exception:
+            # try printing inside iframes
+            for f in label_page.frames:
+                if f == label_page.main_frame: continue
                 try:
-                    with open(path + ".check.json", "w", encoding="utf-8") as f:
-                        json.dump(sidecar, f, indent=2, ensure_ascii=False)
-                except Exception as e:
-                    logging.warning("Couldn't write JSON sidecar: %s", e)
+                    f.evaluate("() => window.print && window.print()")
+                    break
+                except:
+                    continue
+        time.sleep(0.7)
+    log(f"Requested {copies} copy/copies (all pages).")
 
-            if issues:
-                msg = f"Issues in {fname}:\n\n" + "\n".join(issues)
-                popup("Invoice Issues", msg)
-                logging.warning("%d issue(s) in %s", len(issues), fname)
-            else:
-                logging.info("No issues in %s", fname)
+# ---------- FedEx special: fetch PDF → split → print subsets ----------
 
-        except Exception as e:
-            logging.exception("Error on %s: %s", fname, e)
-            popup("Invoice Error", f"{fname} error:\n{e}")
+def try_fetch_pdf_bytes(label_page) -> Optional[bytes]:
+    """
+    Try to fetch the PDF content of the current label page from within the browser context.
+    Works if the label URL is same-origin or CORS-permitted. Returns bytes or None.
+    """
+    try:
+        url = label_page.url
+        if not url: return None
+        # Fetch within the page to inherit cookies; return as base64
+        b64 = label_page.evaluate(
+            """async (u) => {
+                try {
+                    const resp = await fetch(u, {credentials:'include'});
+                    if (!resp.ok) return null;
+                    const buf = await resp.arrayBuffer();
+                    const arr = new Uint8Array(buf);
+                    let bin = '';
+                    for (let i=0; i<arr.length; i++) bin += String.fromCharCode(arr[i]);
+                    return btoa(bin);
+                } catch(e) { return null; }
+            }""",
+            url
+        )
+        if not b64: return None
+        return base64.b64decode(b64)
+    except Exception:
+        return None
 
-    def on_created(self, event):
-        if not event.is_directory: self._try_process(event.src_path)
-    def on_moved(self, event):
-        if not event.is_directory: self._try_process(event.dest_path)
+def split_pdf_ranges(pdf_bytes: bytes, ranges: List[List[int]]) -> List[bytes]:
+    """
+    ranges: list of [start, end] 1-based inclusive page numbers.
+    Returns list of PDF byte blobs matching each range (skips if out of bounds).
+    """
+    out_blobs = []
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    total = len(reader.pages)
+    for start, end in ranges:
+        s = max(1, start); e = min(total, end)
+        if s > e: 
+            out_blobs.append(None)
+            continue
+        writer = PdfWriter()
+        for p in range(s-1, e):
+            writer.add_page(reader.pages[p])
+        bio = io.BytesIO()
+        writer.write(bio)
+        out_blobs.append(bio.getvalue())
+    return out_blobs
+
+def open_data_pdf_and_print(context, name: str, pdf_bytes: bytes, copies: int):
+    """
+    Save the PDF to a temp file, open file:// in a new tab, and silent-print (kiosk).
+    """
+    tmp_dir = os.path.join(os.getcwd(), "_alpega_tmp")
+    os.makedirs(tmp_dir, exist_ok=True)
+    path = os.path.join(tmp_dir, f"{name}.pdf")
+    with open(path, "wb") as f:
+        f.write(pdf_bytes)
+
+    page = context.new_page()
+    page.goto("file:///" + path.replace("\\", "/"), wait_until="load")
+    print_all_copies(page, copies)
+    # keep tab open briefly to avoid race with print pipeline
+    time.sleep(1.2)
+    try:
+        page.close()
+    except:
+        pass
+
+def fedex_print_with_ranges(context, label_page):
+    """
+    FedEx rule:
+      - print pages 1–2 twice
+      - print pages 5..end once (skip 3–4)
+    """
+    log("FedEx: trying to fetch and split PDF for page-range printing.")
+    pdf_bytes = try_fetch_pdf_bytes(label_page)
+    if not pdf_bytes:
+        log("FedEx: could not fetch PDF bytes (viewer/CORS blocked). NOT printing to avoid wrong pages.")
+        log("Hint: if there is a download button in Popup A/label viewer, we can click it and use that file.")
+        return
+
+    # Build blobs for 1–2 and 5..end
+    # First we need total page count
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    total = len(reader.pages)
+
+    # (1) pages 1–2
+    part12 = split_pdf_ranges(pdf_bytes, [[1, min(2, total)]])[0]
+    if part12:
+        open_data_pdf_and_print(context, "fedex_pages_1_2", part12, copies=2)
+    else:
+        log("FedEx: document has <1 page? skipping 1–2 set.")
+
+    # (2) pages 5..end (if any)
+    if total >= 5:
+        part5_end = split_pdf_ranges(pdf_bytes, [[5, total]])[0]
+        if part5_end:
+            open_data_pdf_and_print(context, "fedex_pages_5_end", part5_end, copies=1)
+    else:
+        log("FedEx: document has fewer than 5 pages; skipping 5..end set.")
+
+# ---------- Placeholder flags (to integrate later) ----------
+
+def priority_is_S4() -> bool:
+    # TODO: replace with your real logic once integrated
+    return False
+
+def is_outside_netherlands() -> bool:
+    # TODO: replace with your real logic once integrated
+    return False
+
+# ---------- Main ----------
 
 def main():
-    if not os.path.isdir(DOWNLOADS_FOLDER):
-        logging.error(f"Downloads not found: {DOWNLOADS_FOLDER}"); return
-    obs = Observer(); obs.schedule(Handler(), DOWNLOADS_FOLDER, recursive=False)
-    obs.start(); logging.info("Watching for 8-digit PDFs in:\n  " + DOWNLOADS_FOLDER)
-    try:
-        while True: time.sleep(1)
-    except KeyboardInterrupt:
-        obs.stop()
-    obs.join()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--cdp", default="http://localhost:9222",
+                    help="CDP URL for the already-running Edge (started with --remote-debugging-port)")
+    args = ap.parse_args()
+
+    with sync_playwright() as p:
+        browser = p.chromium.connect_over_cdp(args.cdp)
+        if not browser.contexts:
+            raise RuntimeError("No contexts found. Start Edge with --remote-debugging-port + --kiosk-printing.")
+        context = browser.contexts[0]
+
+        page = get_current_order_page(context)
+        if not page:
+            raise RuntimeError("No open order detail tab found (SendungBearbeitung). Open the order first.")
+
+        log(f"Using current tab: {page.url}")
+        ensure_detail_ready(page)
+
+        fwd = detect_forwarder(page)
+        log(f"Forwarder: {fwd}")
+
+        # Routing: select doc(s), open popup, click Print inside, then print per rules
+        def run_doc(value: str, copies: int, fedex_mode: bool = False):
+            select_document(page, value)
+            click_leg_print_button(page)
+            popupA = wait_for_first_popup(context, page)
+            if not click_do_print_in_popupA(popupA):
+                log("Failed to trigger doPrint() in Popup A; skipping.")
+                return
+            label_page = wait_for_label_view_after_do_print(context, popupA)
+            if fedex_mode:
+                fedex_print_with_ranges(context, label_page)
+            else:
+                print_all_copies(label_page, copies)
+
+        if fwd == "FEDEX":
+            # FedEx Label with page-range logic
+            run_doc("LABELXXQQXXlabelFedExWeb", copies=1, fedex_mode=True)
+
+        elif fwd == "DSV-AIR":
+            # Once all pages: Carrier Label
+            run_doc("LABELXXQQXXLabelCarrier", copies=1, fedex_mode=False)
+            # Twice all pages if priority is S4 (placeholder)
+            if priority_is_S4():
+                run_doc("LOADINGLSTXXQQXXLoadinglist_empties", copies=2, fedex_mode=False)
+
+        elif fwd == "DSV-ROAD":
+            # Carrier Label x1
+            run_doc("LABELXXQQXXLabelCarrier", copies=1, fedex_mode=False)
+            # Dock Loading List x1
+            run_doc("LOADINGLSTXXQQXXLoadinglist_empties", copies=1, fedex_mode=False)
+            # CMR Consol x1 if outside NL (placeholder)
+            if is_outside_netherlands():
+                run_doc("LOADINGLSTXXQQXXLoadinglist_CMR_Def_Consol", copies=1, fedex_mode=False)
+
+        elif fwd == "DGF":
+            run_doc("LABELXXQQXXLabelCarrier", copies=1, fedex_mode=False)
+
+        elif fwd == "DHL-EXP":
+            run_doc("LABELXXQQXXLabelDHL_Web", copies=1, fedex_mode=False)
+
+        elif fwd == "KNN":
+            run_doc("LABELXXQQXXLabelCarrier", copies=1, fedex_mode=False)
+
+        elif fwd == "MAERSK":
+            run_doc("LABELXXQQXXLabelCarrier", copies=1, fedex_mode=False)
+
+        elif fwd == "TROMP":
+            run_doc("LABELXXQQXXLabelCarrier", copies=1, fedex_mode=False)
+            run_doc("LOADINGLSTXXQQXXLoadinglist_empties", copies=1, fedex_mode=False)
+            if is_outside_netherlands():
+                run_doc("LOADINGLSTXXQQXXLoadinglist_CMR_Def_Consol", copies=1, fedex_mode=False)
+
+        elif fwd == "VDB":
+            run_doc("LABELXXQQXXLabelCarrier", copies=1, fedex_mode=False)
+            run_doc("LOADINGLSTXXQQXXLoadinglist_empties", copies=1, fedex_mode=False)
+            if is_outside_netherlands():
+                run_doc("LOADINGLSTXXQQXXLoadinglist_CMR_Def_Consol", copies=1, fedex_mode=False)
+
+        else:
+            log("Unknown forwarder. No documents printed.")
+
+        log("Done.")
 
 if __name__ == "__main__":
     main()
